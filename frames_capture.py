@@ -9,16 +9,16 @@ import cv2
 # make the directory for all captured testing videos, if it does not exist
 os.makedirs("./testing_frames", exist_ok=True)
 
-# get the current length (sub directories of testing_frames,
-# to get the current amount of vids captures, so I can make a directory for the new one
-new_folder_id = len([folder for folder in os.listdir('./testing_frames')]) + 1
-
-# then create the new sub directory
-new_folder_path = f"./testing_frames/frame_folder_vid_{new_folder_id}"
-os.makedirs(new_folder_path, exist_ok=True)
-
 # the function to extract the frames from live camera with skipping frames
 def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
+    # get the current length (sub directories of testing_frames,
+    # to get the current amount of vids captures, so I can make a directory for the new one
+    new_folder_id = len([folder for folder in os.listdir('./testing_frames')]) + 1
+
+    # then create the new sub directory
+    new_folder_path = f"./testing_frames/frame_folder_vid_{new_folder_id}"
+    os.makedirs(new_folder_path, exist_ok=True)
+
     # open the connected camera (Logi C270)
     frame_cap = cv2.VideoCapture(1)
 
