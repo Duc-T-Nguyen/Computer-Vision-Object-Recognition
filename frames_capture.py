@@ -57,12 +57,12 @@ def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
         cv2.putText(
 
                 preview,
-                f"Saved Frames So Far: {frames_saved} / {max_frames}",
-                (10,20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0,0,0),
-                1,
+                f"Saved Frames So Far: {frames_saved} / {max_frames}", # text being displayed
+                (10,20), # location on screen
+                cv2.FONT_HERSHEY_SIMPLEX, # font style
+                0.60, # font scale
+                (0,0,0), # font color
+                1, # font thickness
                 cv2.LINE_AA)
         cv2.putText(
             # display message to alert user to how the program could be terminated
@@ -87,6 +87,7 @@ def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
     # release and destroy windows
     frame_cap.release()
     cv2.destroyAllWindows()
+    # calculate and display the the frames captured and where the frames were placed
     final_count = curr_frame_count - start_frame_count
     print(f"\n The program captured {final_count} and placed into {new_folder_path}")
 
