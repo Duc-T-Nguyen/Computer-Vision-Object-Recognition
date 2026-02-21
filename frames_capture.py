@@ -20,7 +20,7 @@ os.makedirs(new_folder_path, exist_ok=True)
 # the function to extract the frames from live camera with skipping frames
 def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
     # open the connected camera (Logi C270)
-    frame_cap = cv2.VideoCapture(1)
+    frame_cap = cv2.VideoCapture(0)
 
     # set resolution (using lesser resolution for storage efficiency)
     frame_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 650)
@@ -28,7 +28,7 @@ def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
 
     # check if the camera is opened
     if not frame_cap.isOpened():
-        raise RuntimeError("Could not open webcame. Try changing the device index")
+        raise RuntimeError("Could not open webcam. Try changing the device index")
 
     curr_frame_count = start_frame_count 
     while True:
@@ -51,10 +51,44 @@ def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
         # write to folder with filename
         frame_filename = os.path.join(new_folder_path, f"{curr_frame_count:04d}.jpg")
         cv2.imwrite(frame_filename, frame)
+        # live preview to see the frames capture
+        frames_saved = curr_frame_count - start_frame_count
+        preview = frame.copy()
+        cv2.putText(
+
+                preview,
+                f"Saved Frames So Far: {frames_saved} / {max_frames}",
+                (10,20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0,0,0),
+                1,
+                cv2.LINE_AA)
+        cv2.putText(
+            # display message to alert user to how the program could be terminated
+            preview,
+            f"Press Q to quit.",
+            (10,50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0,0, 0),
+            1,
+            cv2.LINE_AA,)
+        cv2.imshow("Frame Capture", preview)
+        # see the current progress of the script
+        if frames_saved % 50 == 0:
+            print(f"PROGRESS:: {frames_saved} / {max_frames}")
+        # check to see what key was pressed on the keyboard and break  if true
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("\n The user pressed Q to terminate the program")
+            break
+            
 
     # release and destroy windows
     frame_cap.release()
     cv2.destroyAllWindows()
+    final_count = curr_frame_count - start_frame_count
+    print(f"\n The program captured {final_count} and placed into {new_folder_path}")
 
 # call the function to extract the frames
 extract_frames(2000, 15)
