@@ -29,11 +29,12 @@ def image_hoi_detect(image_url, image_dim, vlm_model = "glm-4.6v-flash"):
                 {
                     "content": 
                         """
-                        You are an expert in human-object-interaction detection.
+                        You are an expert in human-object-interaction detection and particularly throwing HOI detection.
 
-                        You are given an image and its dimension, most likely with a human and an object they are interacting with, detect the interaction and give coordinates of bounding boxes and interaction vector. The format is specified below.
+                        You are given an image and its dimension, most likely with a human and an object they are interacting with or throwing, detect the interaction and give coordinates of bounding boxes and interaction vector. The format is specified below.
 
                         RULES:
+                        - Prioritze throwing actions.
                         - Follow the given format ABSOLUTELY.
                         - NO leading or following text or output.
                         - Give the response in JSON format.
@@ -110,6 +111,8 @@ for vid_dir in video_dirs.iterdir():
 # -----------------------------------
 
 for vid_dir, frames in video_frames.items():
+    os.makedirs(Path(__file__).parent / 'classified_and_detected_frames' / f'{vid_dir}', exist_ok=True)
+
     # call the hoi detection on every frame of a video (that was captured)
     for frame in frames:
         # read the image into OpenCV
@@ -180,17 +183,19 @@ for vid_dir, frames in video_frames.items():
 
         # put the interaction vector above the human's bounding box
         interaction_vector_label = str(interaction_vector)
-        text_org = (round(human_top_left[0] + human_bottom_right[0] / 2) + human_top_left[0], human_top_left[1] - 15)
+        text_org = (human_top_left[0], human_bottom_right[1] - 15)
         image = cv2.putText(image, interaction_vector_label, text_org, font, font_scale, label_color, font_thickness, cv2.LINE_AA)
 
         # ------------------------------------
         #  Show and Save the Image
         # ------------------------------------
 
+        '''
         # show from terminal
         cv2.imshow(f"{interaction_vector}", image)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
+        '''
 
         # save to folder
         try:
