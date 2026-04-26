@@ -92,4 +92,4 @@ def extract_frames(max_frames, skip_frames=0, start_frame_count=0):
     print(f"\n The program captured {final_count} and placed into {new_folder_path}")
 
 # call the function to extract the frames
-extract_frames(2000, 15)
+extract_frames(2000, 5)
