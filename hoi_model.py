@@ -175,7 +175,227 @@ class WristVelocityTracker:
 
     def reset(self):
         self._hist = []
+# ══════════════════════════════════════════════════════════════
+# Ballistic object tracker
+# ══════════════════════════════════════════════════════════════
+class BallisticTracker:
+    """
+    When the detector loses the object (blur, out-of-frame, occlusion during
+    a throw), this estimates where the object *should be* using its last known
+    velocity and a simple gravity model.
 
+    Physics: pos += vel * dt + 0.5 * g * dt²
+    Velocity is estimated from the last two known positions.
+    Confidence decays linearly — after MAX_COASTING frames it gives up.
+    """
+    MAX_COASTING = 30   # ~1 second at 30 fps
+
+    def __init__(self):
+        self._bbox: Optional[np.ndarray] = None
+        self._vel:  np.ndarray = np.zeros(4, dtype=np.float32)  # dx1,dy1,dx2,dy2
+        self._prev_bbox: Optional[np.ndarray] = None
+        self._prev_t:    float = 0.0
+        self._coast_frames: int = 0
+        self._last_t:   float = 0.0
+
+    def update(self, bbox: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Call every frame. Returns best bbox estimate (detected or predicted)."""
+        now = time.monotonic()
+        dt  = max(now - self._last_t, 1e-3) if self._last_t else 0.033
+        self._last_t = now
+
+        if bbox is not None:
+            # Good detection — update velocity from position delta
+            if self._prev_bbox is not None and self._prev_t:
+                prev_dt = max(now - self._prev_t, 1e-3)
+                self._vel = (bbox - self._prev_bbox) / prev_dt
+            self._prev_bbox   = self._bbox
+            self._prev_t      = now
+            self._bbox        = bbox.copy()
+            self._coast_frames = 0
+            return bbox
+
+        # No detection — predict with ballistic model
+        if self._bbox is None:
+            return None
+
+        self._coast_frames += 1
+        if self._coast_frames > self.MAX_COASTING:
+            self._bbox = None
+            self._vel  = np.zeros(4, dtype=np.float32)
+            return None
+
+        # Apply velocity + gravity (gravity pulls cy down: +y in image coords)
+        # Only apply gravity to the y components (indices 1 and 3)
+        gravity = np.array([0.0, 180.0, 0.0, 180.0], dtype=np.float32)  # px/s²
+        self._bbox    = self._bbox + self._vel * dt + 0.5 * gravity * dt * dt
+        self._vel[1] += gravity[1] * dt   # accelerate downward
+        self._vel[3] += gravity[3] * dt
+
+        # Decay confidence of coasting estimate — caller can use coast_frames
+        return self._bbox.copy()
+
+    @property
+    def coasting(self) -> bool:
+        return self._coast_frames > 0
+
+    @property
+    def coast_confidence(self) -> float:
+        """1.0 = fresh detection, 0.0 = MAX_COASTING frames old."""
+        return max(0.0, 1.0 - self._coast_frames / self.MAX_COASTING)
+
+    def reset(self):
+        self.__init__()
+
+
+# ══════════════════════════════════════════════════════════════
+# Throw state machine
+# ══════════════════════════════════════════════════════════════
+from enum import Enum
+
+class ThrowState(Enum):
+    IDLE     = "idle"
+    WINDUP   = "windup"    # arm rising, wrist accelerating toward object
+    RELEASE  = "release"   # wrist speed peak + wrist-obj distance spiking
+    FOLLOW   = "follow"    # post-release, sustain "throwing" label for N frames
+
+class ThrowStateMachine:
+    """
+    Explicit state machine for throw detection.
+
+    Why: the raw HOI head gives a probability per frame. A throw is an *event*
+    spanning ~15-30 frames (windup → release → follow-through). Without a
+    state machine the smoother averages the peak away and the label flickers.
+
+    Transitions:
+      IDLE    → WINDUP   : wrist speed > SPEED_WINDUP and wrist rising
+      WINDUP  → RELEASE  : wrist-obj dist spikes > RELEASE_DIST_JUMP
+      WINDUP  → IDLE     : speed drops without release (false windup)
+      RELEASE → FOLLOW   : immediate, hold "throwing" for FOLLOW_FRAMES
+      FOLLOW  → IDLE     : after FOLLOW_FRAMES
+    """
+    SPEED_WINDUP       = 0.25   # normalised wrist speed to enter windup
+    SPEED_DROP         = 0.10   # speed below which windup is cancelled
+    RELEASE_DIST_JUMP  = 0.12   # wrist-obj dist increase that signals release
+    FOLLOW_FRAMES      = 22     # frames to hold "throwing" after release
+    WINDUP_TIMEOUT     = 45     # frames before windup auto-cancels
+
+    def __init__(self):
+        self.state          = ThrowState.IDLE
+        self._follow_count  = 0
+        self._windup_count  = 0
+        self._prev_wrist_obj_dist: Optional[float] = None
+
+    def update(
+        self,
+        vel_speed:       float,
+        vel_direction:   float,   # +1 = upward/forward, -1 = downward
+        wrist_obj_dist:  float,
+        hoi_head_scores: dict,
+    ) -> dict:
+        """
+        Returns a *patched* scores dict. In FOLLOW state the throwing score
+        is pegged high regardless of what the head thinks.
+        """
+        prev_dist = self._prev_wrist_obj_dist
+        self._prev_wrist_obj_dist = wrist_obj_dist
+
+        # ── State transitions ─────────────────────────────────────────────
+        if self.state == ThrowState.IDLE:
+            if vel_speed > self.SPEED_WINDUP and vel_direction > 0.1:
+                self.state         = ThrowState.WINDUP
+                self._windup_count = 0
+
+        elif self.state == ThrowState.WINDUP:
+            self._windup_count += 1
+            dist_jumped = (
+                prev_dist is not None
+                and wrist_obj_dist - prev_dist > self.RELEASE_DIST_JUMP
+            )
+            if dist_jumped:
+                self.state         = ThrowState.RELEASE
+                self._follow_count = 0
+            elif vel_speed < self.SPEED_DROP or self._windup_count > self.WINDUP_TIMEOUT:
+                self.state = ThrowState.IDLE
+
+        elif self.state == ThrowState.RELEASE:
+            self.state         = ThrowState.FOLLOW
+            self._follow_count = 0
+
+        elif self.state == ThrowState.FOLLOW:
+            self._follow_count += 1
+            if self._follow_count >= self.FOLLOW_FRAMES:
+                self.state = ThrowState.IDLE
+
+        # ── Score patching ────────────────────────────────────────────────
+        scores = dict(hoi_head_scores)
+
+        if self.state in (ThrowState.RELEASE, ThrowState.FOLLOW):
+            # Ramp from 1.0 at release → 0.6 at end of follow
+            t        = self._follow_count / max(self.FOLLOW_FRAMES, 1)
+            throw_sc = 1.0 - 0.4 * t
+            scores["throwing"]       = throw_sc
+            scores["no_interaction"] = 0.0
+            scores["holding"]        = max(0.0, scores.get("holding", 0) * 0.3)
+            scores["catching"]       = max(0.0, scores.get("catching", 0) * 0.5)
+            total = sum(scores.values()) + 1e-9
+            scores = {c: v / total for c, v in scores.items()}
+
+        elif self.state == ThrowState.WINDUP:
+            # Gently boost throwing during windup
+            scores["throwing"] = min(1.0, scores.get("throwing", 0) + 0.25)
+            total = sum(scores.values()) + 1e-9
+            scores = {c: v / total for c, v in scores.items()}
+
+        return scores
+
+    def reset(self):
+        self.__init__()
+
+
+# ══════════════════════════════════════════════════════════════
+# Asymmetric temporal smoother  (replaces TemporalSmoother)
+# ══════════════════════════════════════════════════════════════
+class AsymmetricSmoother:
+    """
+    Different alpha for rising vs falling probability.
+
+    holding / no_interaction use standard alpha.
+    throwing / catching use:
+      alpha_rise  (high = fast rise)  when new score > smoothed score
+      alpha_fall  (low  = slow decay) when new score < smoothed score
+
+    This means a throwing event rises quickly to the peak and then
+    decays slowly — exactly the right envelope for a throw.
+    """
+    def __init__(
+        self,
+        alpha_rise: float = 0.70,   # how fast throwing/catching rises
+        alpha_fall: float = 0.30,   # how slowly throwing/catching decays
+        alpha_std:  float = 0.40,   # holding / no_interaction
+    ):
+        self.alpha_rise = alpha_rise
+        self.alpha_fall = alpha_fall
+        self.alpha_std  = alpha_std
+        self.smoothed   = {c: 1.0 / NUM_HOI for c in HOI_CLASSES}
+
+    def update(self, scores: dict) -> dict:
+        for c in HOI_CLASSES:
+            new_s = scores.get(c, 0.0)
+            old_s = self.smoothed[c]
+
+            if c in ("throwing", "catching"):
+                alpha = self.alpha_rise if new_s > old_s else self.alpha_fall
+            else:
+                alpha = self.alpha_std
+
+            self.smoothed[c] = alpha * new_s + (1.0 - alpha) * old_s
+
+        total = sum(self.smoothed.values()) + 1e-9
+        return {c: v / total for c, v in self.smoothed.items()}
+
+    def reset(self):
+        self.smoothed = {c: 1.0 / NUM_HOI for c in HOI_CLASSES}
 
 # ══════════════════════════════════════════════════════════════
 # HOI Head
@@ -281,8 +501,7 @@ class HOIDetector:
         yolo_path:     str = "yolov8n-pose.pt",
         device:        str = "cuda" if torch.cuda.is_available() else "cpu",
         conf:          float = 0.40,
-        smooth_alpha:  float = 0.45,
-    ):
+        smooth_alpha:  float = 0.45,):
         from ultralytics import YOLO
 
         self.device = device
@@ -317,8 +536,11 @@ class HOIDetector:
             print("[HOI] To train:  python test_hoi.py --train --data data/\n")
 
         self.head.eval()
-        self.smoother  = TemporalSmoother(smooth_alpha)
-        self.wrist_vel = WristVelocityTracker(history=6)
+        self.smoother      = AsymmetricSmoother()
+        self.wrist_vel     = WristVelocityTracker(history=6)
+        self._ballistic    = BallisticTracker()
+        self._throw_sm     = ThrowStateMachine()
+        self._prev_wrist_to_obj_dist = None
         self._fidx     = 0
         print(f"[HOI] Ready on {device}.")
 
@@ -331,7 +553,7 @@ class HOIDetector:
             frame_bgr,
             classes=[PERSON_CLS],
             conf=PERSON_CONF,
-            imgsz=480,       # slightly reduced → faster pose inference
+            imgsz=480,       
             verbose=False,
             device=self.device,
         )
@@ -360,19 +582,18 @@ class HOIDetector:
                 print("  det: (no detections)")
             print(f"  OBJECT_CONF threshold: {OBJECT_CONF}")
 
-        persons, ball_bbox = self._parse_two_results(
-            pose_results[0], det_results[0], H, W)
+        persons, ball_bbox = self._parse_two_results(pose_results[0], det_results[0], H, W)
+
+        ball_bbox = self._ballistic.update(ball_bbox)
+
 
         if ball_bbox is None or not persons:
+            self._throw_sm.reset()
             empty = {c: (1.0 if c=="no_interaction" else 0.0) for c in HOI_CLASSES}
             sm    = self.smoother.update(empty)
             pb    = persons[0]["bbox"] if persons else None
             kp    = persons[0]["kps"]  if persons else None
-            return HOIResult(hoi_class="no_interaction",
-                             confidence=sm["no_interaction"],
-                             scores=sm,
-                             person_bbox=pb, ball_bbox=ball_bbox,
-                             keypoints=kp, frame_idx=self._fidx)
+            return HOIResult(hoi_class="no_interaction", confidence=sm["no_interaction"],scores=sm, person_bbox=pb, ball_bbox=ball_bbox, keypoints=kp, frame_idx=self._fidx)
 
         bcx = (ball_bbox[0] + ball_bbox[2]) / 2
         bcy = (ball_bbox[1] + ball_bbox[3]) / 2
@@ -384,8 +605,7 @@ class HOIDetector:
         ball_crop    = _crop_and_resize(frame_bgr, ball_bbox, CROP_SIZE)
         pose_feat    = _encode_pose(kps, W, H)
         vel_feat     = self.wrist_vel.update(kps, W, H)   # (2,) velocity features
-        spatial_feat = _encode_spatial(pbox, ball_bbox, W, H, kps=kps,
-                                       vel_feat=vel_feat)
+        spatial_feat = _encode_spatial(pbox, ball_bbox, W, H, kps=kps,vel_feat=vel_feat)
 
         with torch.no_grad():
             # _to_tensor returns (3,H,W); add batch dim for single-frame inference
@@ -398,6 +618,19 @@ class HOIDetector:
             probs  = F.softmax(logits, dim=1)[0].cpu().numpy()
 
         frame_scores = {c: float(probs[i]) for i, c in enumerate(HOI_CLASSES)}
+
+        wrist_to_obj_dist = float(np.linalg.norm(spatial_feat[10:12]))
+        vel_speed         = float(vel_feat[0])
+        vel_direction     = float(vel_feat[1])
+
+        frame_scores = self._throw_sm.update(
+            vel_speed, vel_direction,
+            wrist_to_obj_dist, frame_scores,
+        )
+
+        self._prev_wrist_to_obj_dist = wrist_to_obj_dist
+
+        
         smoothed     = self.smoother.update(frame_scores)
         best         = max(smoothed, key=smoothed.get)
 
@@ -408,8 +641,7 @@ class HOIDetector:
             person_bbox=pbox,
             ball_bbox=ball_bbox,
             keypoints=kps,
-            frame_idx=self._fidx,
-        )
+            frame_idx=self._fidx,)
 
     def train_mode(self):
         self.head.train()
@@ -462,10 +694,14 @@ class HOIDetector:
                 if cls != PERSON_CLS:   # exclude person detections
                     objects.append({"bbox": bbox, "conf": conf, "cls": cls})
 
-        # ── Pick best object: closest wrist, within proximity limit ────────
-        # MAX_WRIST_DIST: object must be within 35% of frame width from a wrist.
-        # This prevents background chairs/furniture being picked up.
-        MAX_WRIST_DIST = W * 0.55
+        MAX_WRIST_DIST = W * 0.35
+        MIN_OBJECT_AREA = (W * H) * 0.012
+        MIN_OBJECT_CONF = 0.25
+
+        def obj_area(obj):
+            b = obj["bbox"]
+            return (b[2] - b[0]) * (b[3] - b[1])
+        objects = [o for o in objects if obj_area(o) >= MIN_OBJECT_AREA and o["conf"] >= MIN_OBJECT_CONF]
 
         best_obj = None
         if objects and persons:
@@ -514,10 +750,11 @@ class HOIDetector:
                     )["bbox"]
 
         elif objects:
-            # No person — just take highest-conf known object
             known = [o for o in objects if o["cls"] in OBJECT_CLASSES]
             if known:
                 best_obj = max(known, key=lambda o: o["conf"])["bbox"]
+
+        
 
         return persons, best_obj
 
@@ -671,9 +908,24 @@ class HOIDataset(torch.utils.data.Dataset):
 
         pc = _to_tensor(person_crop)
         bc = _to_tensor(ball_crop)
-        pf = torch.tensor(_encode_pose(kps_aug, W, H),                dtype=torch.float32)
+        pf = torch.tensor(_encode_pose(kps_aug, W, H), dtype=torch.float32)
+
+        # Synthesise velocity per class — critical for throw/catch discrimination
+        if label == HOI_IDX["throwing"]:
+            syn_vel = np.array([np.random.uniform(0.6, 1.0),
+                                np.random.uniform(0.2, 1.0)], dtype=np.float32)
+        elif label == HOI_IDX["catching"]:
+            syn_vel = np.array([np.random.uniform(0.4, 0.9),
+                                np.random.uniform(-1.0, -0.3)], dtype=np.float32)
+        elif label == HOI_IDX["holding"]:
+            syn_vel = np.array([np.random.uniform(0.0, 0.12),
+                                np.random.uniform(-0.15, 0.15)], dtype=np.float32)
+        else:  # no_interaction
+            syn_vel = np.array([np.random.uniform(0.0, 0.25),
+                                np.random.uniform(-0.25, 0.25)], dtype=np.float32)
+
         sf = torch.tensor(_encode_spatial(pbox, ball_bbox, W, H, kps=kps_aug,
-                                           vel_feat=None), dtype=torch.float32)
+                                           vel_feat=syn_vel), dtype=torch.float32)
 
         return pc, bc, pf, sf, torch.tensor(label, dtype=torch.long)
 
