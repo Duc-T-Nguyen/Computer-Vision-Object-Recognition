@@ -1,7 +1,6 @@
 """
 hoi_model.py
 ============
-Hybrid One-Pass HOI Architecture
 """
 
 import math
@@ -26,8 +25,6 @@ NUM_HOI     = len(HOI_CLASSES)
 HOI_IDX     = {c: i for i, c in enumerate(HOI_CLASSES)}
 
 PERSON_CLS    = 0
-# All COCO classes that are commonly held in hand.
-# remote=65 was missing — that's why the remote wasn't detected as an object.
 OBJECT_CLASSES = [
     32,   # sports ball
     39,   # bottle
@@ -38,7 +35,7 @@ OBJECT_CLASSES = [
     49,   # orange
     63,   # laptop
     64,   # mouse
-    65,   # remote  ← THIS was missing (your remote control)
+    65,   # remote
     66,   # keyboard
     67,   # cell phone
     73,   # book
@@ -48,13 +45,16 @@ OBJECT_CLASSES = [
     78,   # hair drier
     79,   # toothbrush
 ]
-BALL_CLS      = 32   # kept for legacy references
+BALL_CLS      = 32
 
-# Two separate thresholds:
-#   PERSON_CONF — keep high so random background people don't trigger
-#   OBJECT_CONF — lower so partially-visible / small handheld objects fire
 PERSON_CONF   = 0.40
-OBJECT_CONF   = 0.15
+OBJECT_CONF   = 0.15          
+
+
+MIN_OBJ_PERSON_AREA_RATIO = 0.008   
+MAX_OBJ_PERSON_AREA_RATIO = 0.30    
+WRIST_SEARCH_RATIO = 0.70           
+MIN_OBJECT_CONF_FINAL = 0.20       
 
 CROP_SIZE   = 64
 D_MODEL     = 128
@@ -95,6 +95,40 @@ class HOIResult:
         return f"[{self.frame_idx:05d}] {self.hoi_class:<16} conf={self.confidence:.2f}  {sc}"
 
 
+class BBoxSmoother:
+    
+    RESET_FRAMES = 5
+
+    def __init__(self, alpha: float = 0.50):
+        self.alpha       = alpha
+        self._smoothed   = None
+        self._none_count = 0
+
+    def update(self, bbox: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if bbox is None:
+            self._none_count += 1
+            if self._none_count >= self.RESET_FRAMES:
+                self._smoothed = None
+            return self._smoothed
+
+        self._none_count = 0
+        if self._smoothed is None:
+            self._smoothed = bbox.copy()
+        else:
+            # NEW: reset if detection jumps more than 20% of frame width
+            prev_cx = (self._smoothed[0] + self._smoothed[2]) / 2
+            new_cx  = (bbox[0] + bbox[2]) / 2
+            if abs(new_cx - prev_cx) > 0.20 * (bbox[2] - bbox[0]) * 3:
+                self._smoothed = bbox.copy()  # hard reset on large jump
+            else:
+                self._smoothed = (self.alpha * bbox + (1.0 - self.alpha) * self._smoothed)
+        return self._smoothed.copy()
+
+    def reset(self):
+        self._smoothed   = None
+        self._none_count = 0
+
+
 # ══════════════════════════════════════════════════════════════
 # Temporal smoother
 # ══════════════════════════════════════════════════════════════
@@ -114,33 +148,15 @@ class TemporalSmoother:
         self.smoothed = {c: 1.0 / NUM_HOI for c in HOI_CLASSES}
 
 
-
 # ══════════════════════════════════════════════════════════════
-# Wrist velocity tracker  (holding vs catching vs throwing)
+# Wrist velocity tracker
 # ══════════════════════════════════════════════════════════════
 class WristVelocityTracker:
-    """
-    Tracks wrist position across the last N frames and computes
-    velocity (speed + direction) as two additional spatial features.
-
-    This is the critical signal that static pose can't provide:
-      holding   : wrist velocity ≈ 0  (stationary)
-      catching  : wrist moving TOWARD object (negative wrist-obj velocity)
-      throwing  : wrist moving AWAY from object (positive wrist-obj velocity)
-                  followed by rapid deceleration after release
-    """
     def __init__(self, history: int = 6):
-        self._hist = []          # [(wx, wy, timestamp), ...]
+        self._hist   = []
         self._maxlen = history
 
     def update(self, kps: np.ndarray, W: int, H: int) -> np.ndarray:
-        """
-        Update with new keypoints, return 2-dim velocity feature:
-          [speed_norm, wrist_direction]
-          speed_norm      : wrist speed normalised 0-1 (saturates at 200px/s)
-          wrist_direction : +1 = moving up/forward (throw), -1 = moving down (catch)
-        """
-        import time
         best_wrist = None
         best_c     = -1.0
         for idx in (9, 10):
@@ -161,61 +177,47 @@ class WristVelocityTracker:
             return np.zeros(2, dtype=np.float32)
         x1, y1, t1 = self._hist[0]
         x2, y2, t2 = self._hist[-1]
-        dt = max(t2 - t1, 1e-3)
-        vx = (x2 - x1) / dt
-        vy = (y2 - y1) / dt
-        speed = math.hypot(vx, vy)
-        speed_norm = min(1.0, speed / 2.0)   # 2.0 = normalised saturate value
-
-        # Direction: negative vy = moving up (throw/raise), positive = moving down
-        # Encode as signed value in [-1, 1]
-        direction = float(np.clip(-vy / (speed + 1e-6), -1.0, 1.0)) if speed > 0.05 else 0.0
-
+        dt  = max(t2 - t1, 1e-3)
+        vx  = (x2 - x1) / dt
+        vy  = (y2 - y1) / dt
+        speed      = math.hypot(vx, vy)
+        speed_norm = min(1.0, speed / 2.0)
+        direction  = float(np.clip(-vy / (speed + 1e-6), -1.0, 1.0)) if speed > 0.05 else 0.0
         return np.array([speed_norm, direction], dtype=np.float32)
 
     def reset(self):
         self._hist = []
+
+
 # ══════════════════════════════════════════════════════════════
 # Ballistic object tracker
 # ══════════════════════════════════════════════════════════════
 class BallisticTracker:
-    """
-    When the detector loses the object (blur, out-of-frame, occlusion during
-    a throw), this estimates where the object *should be* using its last known
-    velocity and a simple gravity model.
-
-    Physics: pos += vel * dt + 0.5 * g * dt²
-    Velocity is estimated from the last two known positions.
-    Confidence decays linearly — after MAX_COASTING frames it gives up.
-    """
-    MAX_COASTING = 30   # ~1 second at 30 fps
+    MAX_COASTING = 30
 
     def __init__(self):
-        self._bbox: Optional[np.ndarray] = None
-        self._vel:  np.ndarray = np.zeros(4, dtype=np.float32)  # dx1,dy1,dx2,dy2
-        self._prev_bbox: Optional[np.ndarray] = None
-        self._prev_t:    float = 0.0
+        self._bbox:       Optional[np.ndarray] = None
+        self._vel:        np.ndarray = np.zeros(4, dtype=np.float32)
+        self._prev_bbox:  Optional[np.ndarray] = None
+        self._prev_t:     float = 0.0
         self._coast_frames: int = 0
-        self._last_t:   float = 0.0
+        self._last_t:     float = 0.0
 
     def update(self, bbox: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """Call every frame. Returns best bbox estimate (detected or predicted)."""
         now = time.monotonic()
         dt  = max(now - self._last_t, 1e-3) if self._last_t else 0.033
         self._last_t = now
 
         if bbox is not None:
-            # Good detection — update velocity from position delta
             if self._prev_bbox is not None and self._prev_t:
-                prev_dt = max(now - self._prev_t, 1e-3)
-                self._vel = (bbox - self._prev_bbox) / prev_dt
-            self._prev_bbox   = self._bbox
-            self._prev_t      = now
-            self._bbox        = bbox.copy()
+                prev_dt    = max(now - self._prev_t, 1e-3)
+                self._vel  = (bbox - self._prev_bbox) / prev_dt
+            self._prev_bbox    = self._bbox
+            self._prev_t       = now
+            self._bbox         = bbox.copy()
             self._coast_frames = 0
             return bbox
 
-        # No detection — predict with ballistic model
         if self._bbox is None:
             return None
 
@@ -225,14 +227,10 @@ class BallisticTracker:
             self._vel  = np.zeros(4, dtype=np.float32)
             return None
 
-        # Apply velocity + gravity (gravity pulls cy down: +y in image coords)
-        # Only apply gravity to the y components (indices 1 and 3)
-        gravity = np.array([0.0, 180.0, 0.0, 180.0], dtype=np.float32)  # px/s²
-        self._bbox    = self._bbox + self._vel * dt + 0.5 * gravity * dt * dt
-        self._vel[1] += gravity[1] * dt   # accelerate downward
+        gravity     = np.array([0.0, 180.0, 0.0, 180.0], dtype=np.float32)
+        self._bbox  = self._bbox + self._vel * dt + 0.5 * gravity * dt * dt
+        self._vel[1] += gravity[1] * dt
         self._vel[3] += gravity[3] * dt
-
-        # Decay confidence of coasting estimate — caller can use coast_frames
         return self._bbox.copy()
 
     @property
@@ -241,7 +239,6 @@ class BallisticTracker:
 
     @property
     def coast_confidence(self) -> float:
-        """1.0 = fresh detection, 0.0 = MAX_COASTING frames old."""
         return max(0.0, 1.0 - self._coast_frames / self.MAX_COASTING)
 
     def reset(self):
@@ -254,53 +251,28 @@ class BallisticTracker:
 from enum import Enum
 
 class ThrowState(Enum):
-    IDLE     = "idle"
-    WINDUP   = "windup"    # arm rising, wrist accelerating toward object
-    RELEASE  = "release"   # wrist speed peak + wrist-obj distance spiking
-    FOLLOW   = "follow"    # post-release, sustain "throwing" label for N frames
+    IDLE    = "idle"
+    WINDUP  = "windup"
+    RELEASE = "release"
+    FOLLOW  = "follow"
 
 class ThrowStateMachine:
-    """
-    Explicit state machine for throw detection.
-
-    Why: the raw HOI head gives a probability per frame. A throw is an *event*
-    spanning ~15-30 frames (windup → release → follow-through). Without a
-    state machine the smoother averages the peak away and the label flickers.
-
-    Transitions:
-      IDLE    → WINDUP   : wrist speed > SPEED_WINDUP and wrist rising
-      WINDUP  → RELEASE  : wrist-obj dist spikes > RELEASE_DIST_JUMP
-      WINDUP  → IDLE     : speed drops without release (false windup)
-      RELEASE → FOLLOW   : immediate, hold "throwing" for FOLLOW_FRAMES
-      FOLLOW  → IDLE     : after FOLLOW_FRAMES
-    """
-    SPEED_WINDUP       = 0.25   # normalised wrist speed to enter windup
-    SPEED_DROP         = 0.10   # speed below which windup is cancelled
-    RELEASE_DIST_JUMP  = 0.12   # wrist-obj dist increase that signals release
-    FOLLOW_FRAMES      = 22     # frames to hold "throwing" after release
-    WINDUP_TIMEOUT     = 45     # frames before windup auto-cancels
+    SPEED_WINDUP      = 0.25
+    SPEED_DROP        = 0.10
+    RELEASE_DIST_JUMP = 0.12
+    FOLLOW_FRAMES     = 22
+    WINDUP_TIMEOUT    = 45
 
     def __init__(self):
-        self.state          = ThrowState.IDLE
-        self._follow_count  = 0
-        self._windup_count  = 0
+        self.state         = ThrowState.IDLE
+        self._follow_count = 0
+        self._windup_count = 0
         self._prev_wrist_obj_dist: Optional[float] = None
 
-    def update(
-        self,
-        vel_speed:       float,
-        vel_direction:   float,   # +1 = upward/forward, -1 = downward
-        wrist_obj_dist:  float,
-        hoi_head_scores: dict,
-    ) -> dict:
-        """
-        Returns a *patched* scores dict. In FOLLOW state the throwing score
-        is pegged high regardless of what the head thinks.
-        """
-        prev_dist = self._prev_wrist_obj_dist
+    def update(self, vel_speed, vel_direction, wrist_obj_dist, hoi_head_scores):
+        prev_dist                 = self._prev_wrist_obj_dist
         self._prev_wrist_obj_dist = wrist_obj_dist
 
-        # ── State transitions ─────────────────────────────────────────────
         if self.state == ThrowState.IDLE:
             if vel_speed > self.SPEED_WINDUP and vel_direction > 0.1:
                 self.state         = ThrowState.WINDUP
@@ -308,10 +280,8 @@ class ThrowStateMachine:
 
         elif self.state == ThrowState.WINDUP:
             self._windup_count += 1
-            dist_jumped = (
-                prev_dist is not None
-                and wrist_obj_dist - prev_dist > self.RELEASE_DIST_JUMP
-            )
+            dist_jumped = (prev_dist is not None
+                           and wrist_obj_dist - prev_dist > self.RELEASE_DIST_JUMP)
             if dist_jumped:
                 self.state         = ThrowState.RELEASE
                 self._follow_count = 0
@@ -327,53 +297,28 @@ class ThrowStateMachine:
             if self._follow_count >= self.FOLLOW_FRAMES:
                 self.state = ThrowState.IDLE
 
-        # ── Score patching ────────────────────────────────────────────────
         scores = dict(hoi_head_scores)
-
         if self.state in (ThrowState.RELEASE, ThrowState.FOLLOW):
-            # Ramp from 1.0 at release → 0.6 at end of follow
             t        = self._follow_count / max(self.FOLLOW_FRAMES, 1)
             throw_sc = 1.0 - 0.4 * t
             scores["throwing"]       = throw_sc
             scores["no_interaction"] = 0.0
             scores["holding"]        = max(0.0, scores.get("holding", 0) * 0.3)
             scores["catching"]       = max(0.0, scores.get("catching", 0) * 0.5)
-            total = sum(scores.values()) + 1e-9
+            total  = sum(scores.values()) + 1e-9
             scores = {c: v / total for c, v in scores.items()}
-
         elif self.state == ThrowState.WINDUP:
-            # Gently boost throwing during windup
             scores["throwing"] = min(1.0, scores.get("throwing", 0) + 0.25)
-            total = sum(scores.values()) + 1e-9
+            total  = sum(scores.values()) + 1e-9
             scores = {c: v / total for c, v in scores.items()}
-
         return scores
 
     def reset(self):
         self.__init__()
 
 
-# ══════════════════════════════════════════════════════════════
-# Asymmetric temporal smoother  (replaces TemporalSmoother)
-# ══════════════════════════════════════════════════════════════
 class AsymmetricSmoother:
-    """
-    Different alpha for rising vs falling probability.
-
-    holding / no_interaction use standard alpha.
-    throwing / catching use:
-      alpha_rise  (high = fast rise)  when new score > smoothed score
-      alpha_fall  (low  = slow decay) when new score < smoothed score
-
-    This means a throwing event rises quickly to the peak and then
-    decays slowly — exactly the right envelope for a throw.
-    """
-    def __init__(
-        self,
-        alpha_rise: float = 0.70,   # how fast throwing/catching rises
-        alpha_fall: float = 0.30,   # how slowly throwing/catching decays
-        alpha_std:  float = 0.40,   # holding / no_interaction
-    ):
+    def __init__(self, alpha_rise=0.70, alpha_fall=0.30, alpha_std=0.40):
         self.alpha_rise = alpha_rise
         self.alpha_fall = alpha_fall
         self.alpha_std  = alpha_std
@@ -383,19 +328,17 @@ class AsymmetricSmoother:
         for c in HOI_CLASSES:
             new_s = scores.get(c, 0.0)
             old_s = self.smoothed[c]
-
             if c in ("throwing", "catching"):
                 alpha = self.alpha_rise if new_s > old_s else self.alpha_fall
             else:
                 alpha = self.alpha_std
-
             self.smoothed[c] = alpha * new_s + (1.0 - alpha) * old_s
-
         total = sum(self.smoothed.values()) + 1e-9
         return {c: v / total for c, v in self.smoothed.items()}
 
     def reset(self):
         self.smoothed = {c: 1.0 / NUM_HOI for c in HOI_CLASSES}
+
 
 # ══════════════════════════════════════════════════════════════
 # HOI Head
@@ -409,10 +352,8 @@ class CropCNN(nn.Module):
             nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.BatchNorm2d(32), nn.ReLU(True),
             nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
             nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, out_dim),
-            nn.LayerNorm(out_dim),
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(64, out_dim), nn.LayerNorm(out_dim),
         )
     def forward(self, x):
         return self.net(x)
@@ -423,8 +364,7 @@ class PoseMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(NUM_KP * 3, 128), nn.ReLU(True),
-            nn.Linear(128, out_dim),
-            nn.LayerNorm(out_dim),
+            nn.Linear(128, out_dim), nn.LayerNorm(out_dim),
         )
     def forward(self, x):
         return self.net(x)
@@ -434,27 +374,14 @@ class SpatialMLP(nn.Module):
     def __init__(self, out_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(20, 64), nn.ReLU(True),   # 20-dim: +wrist velocity speed + direction + object aspect ratio + wrist in object
-            nn.Linear(64, out_dim),
-            nn.LayerNorm(out_dim),
+            nn.Linear(20, 64), nn.ReLU(True),
+            nn.Linear(64, out_dim), nn.LayerNorm(out_dim),
         )
     def forward(self, x):
         return self.net(x)
 
 
 class HOIHead(nn.Module):
-    """
-    Pose + spatial geometry only — no image crop CNNs.
-
-    WHY we removed CropCNN:
-      The person/ball crops contain your face, shirt colour, and room.
-      That's exactly what was memorised at 99% train accuracy.
-      Pose keypoints and spatial geometry are person/camera/lighting invariant.
-
-    Two tokens → Transformer → classifier:
-      token_0  pose     (17 keypoints → PoseMLP → 128-d)
-      token_1  spatial  (14-d geometry → SpatialMLP → 128-d)
-    """
     def __init__(self, d_model: int = D_MODEL, n_heads: int = 4, n_layers: int = 2):
         super().__init__()
         self.pose_enc    = PoseMLP(out_dim=d_model)
@@ -463,31 +390,45 @@ class HOIHead(nn.Module):
             nn.Linear(d_model // 2, d_model),
             nn.LayerNorm(d_model),
         )
-
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dim_feedforward=d_model * 2,
             dropout=0.2, batch_first=True, norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(d_model, NUM_HOI),
+        self.classifier  = nn.Sequential(
+            nn.Linear(d_model * 2, d_model), nn.GELU(),
+            nn.Dropout(0.2), nn.Linear(d_model, NUM_HOI),
         )
 
     def forward(self, person_crop, ball_crop, pose_feat, spatial_feat):
-        # person_crop and ball_crop accepted but unused —
-        # kept so HOIDataset and predict() need no signature changes
-        t0 = self.pose_enc(pose_feat)
-        t1 = self.spatial_enc(spatial_feat)
-        tokens = torch.stack([t0, t1], dim=1)   # (B, 2, 128)
+        t0     = self.pose_enc(pose_feat)
+        t1     = self.spatial_enc(spatial_feat)
+        tokens = torch.stack([t0, t1], dim=1)
         tokens = self.transformer(tokens)
-        fused  = tokens.reshape(tokens.shape[0], -1)   # (B, 256)
+        fused  = tokens.reshape(tokens.shape[0], -1)
         return self.classifier(fused)
 
+
+# ══════════════════════════════════════════════════════════════
+# Helper: IoU between two bboxes [x1,y1,x2,y2]
+# ══════════════════════════════════════════════════════════════
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    ua    = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / (ua + 1e-6)
+
+
+def _clamp_bbox(bbox: np.ndarray, W: int, H: int) -> np.ndarray:
+    """Clamp bbox to frame boundaries."""
+    return np.array([
+        max(0.0, bbox[0]), max(0.0, bbox[1]),
+        min(W,   bbox[2]), min(H,   bbox[3]),
+    ], dtype=np.float32)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -501,72 +442,54 @@ class HOIDetector:
         yolo_path:     str = "yolov8n-pose.pt",
         device:        str = "cuda" if torch.cuda.is_available() else "cpu",
         conf:          float = 0.40,
-        smooth_alpha:  float = 0.45,):
+        smooth_alpha:  float = 0.45,
+    ):
         from ultralytics import YOLO
 
         self.device = device
         self.conf   = conf
 
-        # Pose model — detects person + keypoints
         print(f"[HOI] Loading pose model: {yolo_path}")
         self.yolo_pose = YOLO(yolo_path)
 
-        # Detection model — detects objects (no class filter, catches everything)
         print(f"[HOI] Loading detection model: yolov8n.pt")
         self.yolo_det  = YOLO("yolov8n.pt")
 
-        # Warm up both models
         _dummy = np.zeros((480, 640, 3), dtype=np.uint8)
         self.yolo_pose(_dummy, classes=[PERSON_CLS], conf=PERSON_CONF,
                        verbose=False, device=device)
         self.yolo_det(_dummy,  conf=OBJECT_CONF,
                       verbose=False, device=device)
-        # Keep self.yolo pointing to pose model for any legacy references
         self.yolo = self.yolo_pose
         print("[HOI] Both models warmed up.")
 
         self.head = HOIHead().to(device)
-
         if hoi_head_path:
             self._load_head(hoi_head_path)
         else:
-            print("[HOI] No HOI head weights given — head has random weights.")
-            print("[HOI] Detection + pose will work correctly (YOLO is pretrained).")
-            print("[HOI] HOI classification will be wrong until you train.")
-            print("[HOI] To train:  python test_hoi.py --train --data data/\n")
+            print("[HOI] No HOI head weights given — using random weights.")
 
         self.head.eval()
         self.smoother      = AsymmetricSmoother()
         self.wrist_vel     = WristVelocityTracker(history=6)
         self._ballistic    = BallisticTracker()
+        self._bbox_smooth  = BBoxSmoother(alpha=0.50)   # FIX 5
         self._throw_sm     = ThrowStateMachine()
         self._prev_wrist_to_obj_dist = None
-        self._fidx     = 0
+        self._fidx = 0
         print(f"[HOI] Ready on {device}.")
 
     def predict(self, frame_bgr: np.ndarray, debug: bool = False) -> HOIResult:
         self._fidx += 1
         H, W = frame_bgr.shape[:2]
 
-        # ── Pass 1: pose model → person bboxes + keypoints ────────────────
         pose_results = self.yolo_pose(
-            frame_bgr,
-            classes=[PERSON_CLS],
-            conf=PERSON_CONF,
-            imgsz=480,       
-            verbose=False,
-            device=self.device,
+            frame_bgr, classes=[PERSON_CLS], conf=PERSON_CONF,
+            imgsz=480, verbose=False, device=self.device,
         )
-
-        # ── Pass 2: detection model → handheld objects only ──────────────
-        # Filter to OBJECT_CLASSES so background furniture never fires.
         det_results = self.yolo_det(
-            frame_bgr,
-            classes=OBJECT_CLASSES,
-            conf=OBJECT_CONF,
-            imgsz=480,       # half resolution → 2x faster, still accurate for objects
-            verbose=False,
-            device=self.device,
+            frame_bgr, classes=OBJECT_CLASSES, conf=OBJECT_CONF,
+            imgsz=480, verbose=False, device=self.device,
         )
 
         if debug and self._fidx % 10 == 0:
@@ -582,21 +505,37 @@ class HOIDetector:
                 print("  det: (no detections)")
             print(f"  OBJECT_CONF threshold: {OBJECT_CONF}")
 
-        persons, ball_bbox = self._parse_two_results(pose_results[0], det_results[0], H, W)
+        persons, raw_ball_bbox = self._parse_two_results(
+            pose_results[0], det_results[0], H, W
+        )
 
-        ball_bbox = self._ballistic.update(ball_bbox)
+        # Clamp raw detection to frame (FIX 6)
+        if raw_ball_bbox is not None:
+            raw_ball_bbox = _clamp_bbox(raw_ball_bbox, W, H)
 
+        # BBox smoother before ballistic (FIX 5)
+        smoothed_obj = self._bbox_smooth.update(raw_ball_bbox)
+
+        # Ballistic prediction if detector misses
+        ball_bbox = self._ballistic.update(smoothed_obj)
+
+        if ball_bbox is not None:
+            ball_bbox = _clamp_bbox(ball_bbox, W, H)
 
         if ball_bbox is None or not persons:
             self._throw_sm.reset()
-            empty = {c: (1.0 if c=="no_interaction" else 0.0) for c in HOI_CLASSES}
+            empty = {c: (1.0 if c == "no_interaction" else 0.0) for c in HOI_CLASSES}
             sm    = self.smoother.update(empty)
             pb    = persons[0]["bbox"] if persons else None
             kp    = persons[0]["kps"]  if persons else None
-            return HOIResult(hoi_class="no_interaction", confidence=sm["no_interaction"],scores=sm, person_bbox=pb, ball_bbox=ball_bbox, keypoints=kp, frame_idx=self._fidx)
+            return HOIResult(
+                hoi_class="no_interaction", confidence=sm["no_interaction"],
+                scores=sm, person_bbox=pb, ball_bbox=ball_bbox,
+                keypoints=kp, frame_idx=self._fidx,
+            )
 
-        bcx = (ball_bbox[0] + ball_bbox[2]) / 2
-        bcy = (ball_bbox[1] + ball_bbox[3]) / 2
+        bcx    = (ball_bbox[0] + ball_bbox[2]) / 2
+        bcy    = (ball_bbox[1] + ball_bbox[3]) / 2
         person = min(persons, key=lambda p: _box_dist(p["bbox"], bcx, bcy))
         pbox   = person["bbox"]
         kps    = person["kps"]
@@ -604,50 +543,40 @@ class HOIDetector:
         person_crop  = _crop_and_resize(frame_bgr, pbox, CROP_SIZE)
         ball_crop    = _crop_and_resize(frame_bgr, ball_bbox, CROP_SIZE)
         pose_feat    = _encode_pose(kps, W, H)
-        vel_feat     = self.wrist_vel.update(kps, W, H)   # (2,) velocity features
-        spatial_feat = _encode_spatial(pbox, ball_bbox, W, H, kps=kps,vel_feat=vel_feat)
+        vel_feat     = self.wrist_vel.update(kps, W, H)
+        spatial_feat = _encode_spatial(pbox, ball_bbox, W, H, kps=kps, vel_feat=vel_feat)
 
         with torch.no_grad():
-            # _to_tensor returns (3,H,W); add batch dim for single-frame inference
-            pc = _to_tensor(person_crop, self.device).unsqueeze(0)   # (1, 3, 64, 64)
-            bc = _to_tensor(ball_crop,   self.device).unsqueeze(0)   # (1, 3, 64, 64)
-            pf = torch.tensor(pose_feat,    dtype=torch.float32).unsqueeze(0).to(self.device)  # (1, 51)
-            sf = torch.tensor(spatial_feat, dtype=torch.float32).unsqueeze(0).to(self.device)  # (1, 10)
-
+            pc = _to_tensor(person_crop, self.device).unsqueeze(0)
+            bc = _to_tensor(ball_crop,   self.device).unsqueeze(0)
+            pf = torch.tensor(pose_feat,    dtype=torch.float32).unsqueeze(0).to(self.device)
+            sf = torch.tensor(spatial_feat, dtype=torch.float32).unsqueeze(0).to(self.device)
             logits = self.head(pc, bc, pf, sf)
             probs  = F.softmax(logits, dim=1)[0].cpu().numpy()
 
-        frame_scores = {c: float(probs[i]) for i, c in enumerate(HOI_CLASSES)}
-
+        frame_scores      = {c: float(probs[i]) for i, c in enumerate(HOI_CLASSES)}
         wrist_to_obj_dist = float(np.linalg.norm(spatial_feat[10:12]))
         vel_speed         = float(vel_feat[0])
         vel_direction     = float(vel_feat[1])
 
         frame_scores = self._throw_sm.update(
-            vel_speed, vel_direction,
-            wrist_to_obj_dist, frame_scores,
+            vel_speed, vel_direction, wrist_to_obj_dist, frame_scores,
         )
-
         self._prev_wrist_to_obj_dist = wrist_to_obj_dist
 
-        
-        smoothed     = self.smoother.update(frame_scores)
-        best         = max(smoothed, key=smoothed.get)
+        smoothed = self.smoother.update(frame_scores)
+        best     = max(smoothed, key=smoothed.get)
 
         return HOIResult(
-            hoi_class=best,
-            confidence=round(smoothed[best], 3),
-            scores=smoothed,
-            person_bbox=pbox,
-            ball_bbox=ball_bbox,
-            keypoints=kps,
-            frame_idx=self._fidx,)
+            hoi_class=best, confidence=round(smoothed[best], 3),
+            scores=smoothed, person_bbox=pbox, ball_bbox=ball_bbox,
+            keypoints=kps, frame_idx=self._fidx,
+        )
 
-    def train_mode(self):
-        self.head.train()
+    # ── internal helpers ────────────────────────────────────────────────────
 
-    def eval_mode(self):
-        self.head.eval()
+    def train_mode(self): self.head.train()
+    def eval_mode(self):  self.head.eval()
 
     def save_head(self, path: str):
         import os
@@ -664,13 +593,18 @@ class HOIDetector:
 
     def _parse_two_results(self, pose_r, det_r, H, W):
         """
-        Parse results from two separate YOLO calls:
-          pose_r  — from yolo_pose (persons + keypoints)
-          det_r   — from yolo_det  (all object detections, no class filter)
+        Parse results from two separate YOLO calls.
+
+        Key fixes vs original:
+        - Object bbox size is validated against person bbox (not raw frame size)
+        - Wrist search radius is relative to person width
+        - Improved fallback chain: wrist → person-interior → highest-conf
+        - IoU-based dedup removes overlapping low-conf detections
+        - All returned bboxes are clamped to frame bounds
         """
-        # ── Extract persons from pose result ────────────────────────────────
-        persons  = []
-        kp_data  = pose_r.keypoints.data if pose_r.keypoints is not None else None
+        # ── Persons from pose result ─────────────────────────────────────
+        persons   = []
+        kp_data   = pose_r.keypoints.data if pose_r.keypoints is not None else None
         kp_cursor = 0
         if pose_r.boxes is not None:
             for box in pose_r.boxes:
@@ -681,142 +615,135 @@ class HOIDetector:
                     kps = (kp_data[kp_cursor].cpu().numpy()
                            if kp_data is not None and kp_cursor < len(kp_data)
                            else np.zeros((17, 3), dtype=np.float32))
-                    persons.append({"bbox": bbox, "kps": kps})
+                    persons.append({"bbox": _clamp_bbox(bbox, W, H), "kps": kps})
                 kp_cursor += 1
 
-        # ── Extract objects from detection result (everything non-person) ───
-        objects = []
+        # ── Raw objects from detection result ────────────────────────────
+        raw_objects = []
         if det_r.boxes is not None:
             for box in det_r.boxes:
                 cls  = int(box.cls[0])
                 conf = float(box.conf[0])
                 bbox = np.array(box.xyxy[0].tolist(), dtype=np.float32)
-                if cls != PERSON_CLS:   # exclude person detections
-                    objects.append({"bbox": bbox, "conf": conf, "cls": cls})
+                if cls != PERSON_CLS:
+                    raw_objects.append({"bbox": _clamp_bbox(bbox, W, H),
+                                        "conf": conf, "cls": cls})
 
-        MAX_WRIST_DIST = W * 0.35
-        MIN_OBJECT_AREA = (W * H) * 0.012
-        MIN_OBJECT_CONF = 0.25
+        if not raw_objects or not persons:
+            # No objects or no persons — no interaction
+            return persons, None
 
-        def obj_area(obj):
-            b = obj["bbox"]
-            return (b[2] - b[0]) * (b[3] - b[1])
-        objects = [o for o in objects if obj_area(o) >= MIN_OBJECT_AREA and o["conf"] >= MIN_OBJECT_CONF]
+        # ── Area filter relative to person bbox (FIX 1, 2) ──────────────
+        px1, py1, px2, py2 = persons[0]["bbox"]
+        person_area = max((px2 - px1) * (py2 - py1), 1.0)
+
+        def obj_area(o):
+            b = o["bbox"]
+            return max((b[2] - b[0]) * (b[3] - b[1]), 1.0)
+
+        objects = []
+        for o in raw_objects:
+            a     = obj_area(o)
+            ratio = a / person_area
+            if (MIN_OBJ_PERSON_AREA_RATIO <= ratio <= MAX_OBJ_PERSON_AREA_RATIO
+                    and o["conf"] >= MIN_OBJECT_CONF_FINAL):
+                objects.append(o)
+
+        # If strict filter removes everything, fall back to looser area check
+        if not objects:
+            objects = [o for o in raw_objects
+                       if obj_area(o) / person_area >= MIN_OBJ_PERSON_AREA_RATIO * 0.4
+                       and o["conf"] >= OBJECT_CONF]
+
+        if not objects:
+            return persons, None
+        
+        
+
+        # ── IoU-based dedup — remove heavily overlapping boxes (FIX 1) ──
+        objects.sort(key=lambda o: o["conf"], reverse=True)
+        kept = []
+        for o in objects:
+            if not any(_iou(o["bbox"], k["bbox"]) > 0.55 for k in kept):
+                kept.append(o)
+        objects = kept
+
+        # ── Wrist-proximity search (FIX 3) ───────────────────────────────
+        kps    = persons[0]["kps"]
+        person_w = px2 - px1
+        max_wrist_dist = person_w * WRIST_SEARCH_RATIO   # relative to person
+
+        wrists = [(float(kps[i][0]), float(kps[i][1]))
+                  for i in (9, 10) if float(kps[i][2]) > 0.10]  # lowered from 0.25
 
         best_obj = None
-        if objects and persons:
-            kps    = persons[0]["kps"]
-            wrists = [(float(kps[i][0]), float(kps[i][1]))
-                      for i in (9, 10) if kps[i][2] > 0.10]
 
-            if wrists:
-                def wdist(obj):
-                    ocx = (obj["bbox"][0] + obj["bbox"][2]) / 2
-                    ocy = (obj["bbox"][1] + obj["bbox"][3]) / 2
-                    return min(math.hypot(ocx-wx, ocy-wy) for wx, wy in wrists)
+        if wrists:
+            def wdist(obj):
+                ocx = (obj["bbox"][0] + obj["bbox"][2]) / 2
+                ocy = (obj["bbox"][1] + obj["bbox"][3]) / 2
+                return min(math.hypot(ocx - wx, ocy - wy) for wx, wy in wrists)
 
-                # Objects within wrist distance limit
-                nearby = [o for o in objects if wdist(o) < MAX_WRIST_DIST]
+            nearby = [o for o in objects if wdist(o) < max_wrist_dist]
+            if nearby:
+                best_obj = min(nearby, key=wdist)["bbox"]
 
-                if nearby:
-                    best_obj = min(nearby, key=wdist)["bbox"]
-                else:
-                    # Nothing near wrists — try nearest object to person bbox center
-                    px1,py1,px2,py2 = persons[0]["bbox"]
-                    pcx = (px1+px2)/2; pcy = (py1+py2)/2
-                    def pdist(obj):
-                        ocx = (obj["bbox"][0]+obj["bbox"][2])/2
-                        ocy = (obj["bbox"][1]+obj["bbox"][3])/2
-                        return math.hypot(ocx-pcx, ocy-pcy)
-                    # Only grab if within the person bbox bounds
-                    inside = [o for o in objects
-                              if px1 < (o["bbox"][0]+o["bbox"][2])/2 < px2
-                              and py1 < (o["bbox"][1]+o["bbox"][3])/2 < py2]
-                    if inside:
-                        best_obj = min(inside, key=pdist)["bbox"]
-            else:
-                # No wrist keypoints — take highest-conf known object inside person bbox
-                px1,py1,px2,py2 = persons[0]["bbox"]
-                inside = [o for o in objects
-                          if o["cls"] in OBJECT_CLASSES
-                          and px1 < (o["bbox"][0]+o["bbox"][2])/2 < px2
-                          and py1 < (o["bbox"][1]+o["bbox"][3])/2 < py2]
-                if inside:
-                    best_obj = max(inside, key=lambda o: o["conf"])["bbox"]
-                elif objects:
-                    best_obj = max(
-                        [o for o in objects if o["cls"] in OBJECT_CLASSES] or objects,
-                        key=lambda o: o["conf"]
-                    )["bbox"]
+        # FIX 4: Fallback — wrist-based search failed, try person-interior
+        if best_obj is None:
+            pcx = (px1 + px2) / 2
+            pcy = (py1 + py2) / 2
+            interior = [o for o in objects
+                        if px1 < (o["bbox"][0] + o["bbox"][2]) / 2 < px2
+                        and py1 < (o["bbox"][1] + o["bbox"][3]) / 2 < py2]
+            if interior:
+                best_obj = min(
+                    interior,
+                    key=lambda o: math.hypot(
+                        (o["bbox"][0]+o["bbox"][2])/2 - pcx,
+                        (o["bbox"][1]+o["bbox"][3])/2 - pcy,
+                    )
+                )["bbox"]
 
-        elif objects:
-            known = [o for o in objects if o["cls"] in OBJECT_CLASSES]
-            if known:
-                best_obj = max(known, key=lambda o: o["conf"])["bbox"]
-
-        
+        # Final fallback — highest-confidence object
+        if best_obj is None:
+            best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
 
         return persons, best_obj
 
+    # kept for dataset compatibility
     def _parse_yolo(self, r, H, W):
-        """
-        Parse YOLO result into persons and best object bbox.
-
-        Two-threshold strategy:
-          - Persons  kept at PERSON_CONF (0.40)
-          - Objects  kept at OBJECT_CONF (0.25) — catches small/partial objects
-            in hand that YOLO is less confident about
-
-        Object selection: pick the object closest to either wrist.
-        No wrist fallback — if nothing detected return None so caller
-        outputs no_interaction cleanly instead of guessing.
-        """
-        persons   = []
-        objects   = []
-        kp_data   = r.keypoints.data if r.keypoints is not None else None
+        persons  = []
+        objects  = []
+        kp_data  = r.keypoints.data if r.keypoints is not None else None
         kp_cursor = 0
-
         for box in r.boxes:
             cls  = int(box.cls[0])
             conf = float(box.conf[0])
             bbox = np.array(box.xyxy[0].tolist(), dtype=np.float32)
-
             if cls == PERSON_CLS:
-                # still need to advance kp_cursor even if below threshold
                 kps = (kp_data[kp_cursor].cpu().numpy()
                        if kp_data is not None and kp_cursor < len(kp_data)
                        else np.zeros((17, 3), dtype=np.float32))
                 kp_cursor += 1
                 if conf >= PERSON_CONF:
                     persons.append({"bbox": bbox, "kps": kps})
-
-            elif cls in OBJECT_CLASSES:
-                # lower threshold so partially-visible handheld objects fire
-                if conf >= OBJECT_CONF:
-                    objects.append({"bbox": bbox, "conf": conf, "cls": cls})
-
+            elif cls in OBJECT_CLASSES and conf >= OBJECT_CONF:
+                objects.append({"bbox": bbox, "conf": conf, "cls": cls})
         best_obj_bbox = None
-
         if objects and persons:
             kps    = persons[0]["kps"]
             wrists = [(float(kps[i][0]), float(kps[i][1]))
                       for i in (9, 10) if kps[i][2] > 0.2]
-
             if wrists:
                 def wrist_dist(obj):
                     ocx = (obj["bbox"][0] + obj["bbox"][2]) / 2
                     ocy = (obj["bbox"][1] + obj["bbox"][3]) / 2
-                    return min(math.hypot(ocx - wx, ocy - wy)
-                               for wx, wy in wrists)
+                    return min(math.hypot(ocx-wx, ocy-wy) for wx, wy in wrists)
                 best_obj_bbox = min(objects, key=wrist_dist)["bbox"]
             else:
                 best_obj_bbox = max(objects, key=lambda o: o["conf"])["bbox"]
-
         elif objects:
             best_obj_bbox = max(objects, key=lambda o: o["conf"])["bbox"]
-
-        # No fallback — return None if nothing detected so predict()
-        # returns no_interaction instead of running on garbage data
         return persons, best_obj_bbox
 
 
@@ -825,17 +752,8 @@ class HOIDetector:
 # ══════════════════════════════════════════════════════════════
 
 class HOILoss(nn.Module):
-    """
-    Weighted cross-entropy with label smoothing.
-    Label smoothing (0.15) prevents the model from becoming overconfident —
-    which is exactly the cause of the 100% train accuracy / 100% no_interaction
-    at inference problem. It forces the model to keep small probability mass
-    on non-predicted classes, so it generalises instead of memorising.
-    """
     def __init__(self):
         super().__init__()
-        # Order matches HOI_CLASSES: throwing, catching, holding, no_interaction
-        # throwing=2.0  catching=0.7  holding=2.5  no_interaction=2.0
         weights = torch.tensor([2.0, 0.7, 2.5, 2.0], dtype=torch.float32)
         self.ce = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
 
@@ -846,8 +764,7 @@ class HOILoss(nn.Module):
 class HOIDataset(torch.utils.data.Dataset):
     def __init__(self, data_root: str = "data",
                  yolo_path: str = "yolov8n-pose.pt",
-                 device: str = "cpu",
-                 conf: float = 0.35):
+                 device: str = "cpu", conf: float = 0.35):
         from ultralytics import YOLO
         from pathlib import Path
 
@@ -876,41 +793,34 @@ class HOIDataset(torch.utils.data.Dataset):
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
         H, W = frame.shape[:2]
-
-        # Use all object classes, not just BALL_CLS
         results = self.yolo(frame, classes=[PERSON_CLS] + OBJECT_CLASSES,
-                             conf=self.conf, verbose=False, device=self.device)
+                            conf=self.conf, verbose=False, device=self.device)
         r       = results[0]
         persons, ball_bbox = _parse_yolo_static(r, H, W)
 
         if not persons:
-            persons = [{"bbox": np.array([0,0,W,H], dtype=np.float32),
-                        "kps":  np.zeros((17,3), dtype=np.float32)}]
+            persons = [{"bbox": np.array([0, 0, W, H], dtype=np.float32),
+                        "kps":  np.zeros((17, 3), dtype=np.float32)}]
         if ball_bbox is None:
             ball_bbox = np.array([W//2-20, H//2-20, W//2+20, H//2+20], dtype=np.float32)
 
-        bcx = (ball_bbox[0] + ball_bbox[2]) / 2
-        bcy = (ball_bbox[1] + ball_bbox[3]) / 2
+        bcx    = (ball_bbox[0] + ball_bbox[2]) / 2
+        bcy    = (ball_bbox[1] + ball_bbox[3]) / 2
         person = min(persons, key=lambda p: _box_dist(p["bbox"], bcx, bcy))
         pbox   = person["bbox"]
         kps    = person["kps"]
 
-        # Augment crops: random brightness/contrast + horizontal flip
-        person_crop = _crop_and_resize(frame, pbox, CROP_SIZE)
-        ball_crop   = _crop_and_resize(frame, ball_bbox, CROP_SIZE)
-        person_crop = _augment_crop(person_crop)
-        ball_crop   = _augment_crop(ball_crop)
+        person_crop = _augment_crop(_crop_and_resize(frame, pbox, CROP_SIZE))
+        ball_crop   = _augment_crop(_crop_and_resize(frame, ball_bbox, CROP_SIZE))
 
-        # Augment pose: add small Gaussian noise to keypoint positions
         kps_aug = kps.copy()
         noise   = np.random.normal(0, 0.01, kps_aug[:, :2].shape).astype(np.float32)
-        kps_aug[:, :2] += noise * (kps_aug[:, 2:3] > 0.25)  # only on confident kps
+        kps_aug[:, :2] += noise * (kps_aug[:, 2:3] > 0.25)
 
         pc = _to_tensor(person_crop)
         bc = _to_tensor(ball_crop)
         pf = torch.tensor(_encode_pose(kps_aug, W, H), dtype=torch.float32)
 
-        # Synthesise velocity per class — critical for throw/catch discrimination
         if label == HOI_IDX["throwing"]:
             syn_vel = np.array([np.random.uniform(0.6, 1.0),
                                 np.random.uniform(0.2, 1.0)], dtype=np.float32)
@@ -920,13 +830,13 @@ class HOIDataset(torch.utils.data.Dataset):
         elif label == HOI_IDX["holding"]:
             syn_vel = np.array([np.random.uniform(0.0, 0.12),
                                 np.random.uniform(-0.15, 0.15)], dtype=np.float32)
-        else:  # no_interaction
+        else:
             syn_vel = np.array([np.random.uniform(0.0, 0.25),
                                 np.random.uniform(-0.25, 0.25)], dtype=np.float32)
 
-        sf = torch.tensor(_encode_spatial(pbox, ball_bbox, W, H, kps=kps_aug,
-                                           vel_feat=syn_vel), dtype=torch.float32)
-
+        sf = torch.tensor(_encode_spatial(pbox, ball_bbox, W, H,
+                                          kps=kps_aug, vel_feat=syn_vel),
+                          dtype=torch.float32)
         return pc, bc, pf, sf, torch.tensor(label, dtype=torch.long)
 
 
@@ -940,55 +850,46 @@ def train_hoi_head(
     yolo_path:  str   = "yolov8n-pose.pt",
 ):
     import os
-
     dataset = HOIDataset(data_root, yolo_path=yolo_path, device=device)
     if len(dataset) == 0:
         print("[Train] No data found. Run data_collector.py first.")
         return
 
-    loader = torch.utils.data.DataLoader(
+    loader    = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
         num_workers=0, pin_memory=False,
     )
-
     head      = HOIHead().to(device)
     criterion = HOILoss().to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    print(f"\n[Train] Training HOI head for {epochs} epochs on {device}")
-    print(f"[Train] {sum(p.numel() for p in head.parameters()):,} parameters\n")
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    print(f"\n[Train] {epochs} epochs  device={device}  "
+          f"params={sum(p.numel() for p in head.parameters()):,}\n")
 
     for epoch in range(epochs):
         head.train()
-        total_loss = 0.0
-        correct    = 0
-        total      = 0
-
+        total_loss = correct = total = 0
         for pc, bc, pf, sf, labels in loader:
             pc, bc  = pc.to(device), bc.to(device)
             pf, sf  = pf.to(device), sf.to(device)
             labels  = labels.to(device)
-
             optimizer.zero_grad()
             logits = head(pc, bc, pf, sf)
             loss   = criterion(logits, labels)
             loss.backward()
             nn.utils.clip_grad_norm_(head.parameters(), 1.0)
             optimizer.step()
-
             total_loss += loss.item() * len(labels)
             correct    += (logits.argmax(1) == labels).sum().item()
             total      += len(labels)
-
         scheduler.step()
         avg_loss = total_loss / max(total, 1)
-        acc      = correct / max(total, 1)
+        acc      = correct   / max(total, 1)
         print(f"Epoch {epoch+1:03d}/{epochs}  "
               f"loss={avg_loss:.4f}  acc={acc:.2%}  "
               f"lr={optimizer.param_groups[0]['lr']:.2e}")
-
         if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
             torch.save(head.state_dict(), save_path)
             print(f"  → saved {save_path}")
@@ -1001,8 +902,7 @@ def train_hoi_head(
 # Feature helpers
 # ══════════════════════════════════════════════════════════════
 
-def _crop_and_resize(frame: np.ndarray, bbox: np.ndarray,
-                     size: int = CROP_SIZE) -> np.ndarray:
+def _crop_and_resize(frame, bbox, size=CROP_SIZE):
     H, W = frame.shape[:2]
     x1 = max(0, int(bbox[0])); y1 = max(0, int(bbox[1]))
     x2 = min(W, int(bbox[2])); y2 = min(H, int(bbox[3]))
@@ -1010,57 +910,32 @@ def _crop_and_resize(frame: np.ndarray, bbox: np.ndarray,
         crop = np.zeros((size, size, 3), dtype=np.uint8)
     else:
         crop = frame[y1:y2, x1:x2]
-    crop = cv2.resize(crop, (size, size))
-    return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    return cv2.cvtColor(cv2.resize(crop, (size, size)), cv2.COLOR_BGR2RGB)
 
 
-def _augment_crop(img_rgb: np.ndarray) -> np.ndarray:
-    """
-    Random augmentation on a (H,W,3) uint8 RGB crop.
-    Applied during training only — makes the model invariant to
-    brightness changes, minor color shifts, and left/right flips.
-    """
-    img = img_rgb.copy().astype(np.float32)
-    # Random brightness  ±30%
+def _augment_crop(img_rgb):
+    img  = img_rgb.copy().astype(np.float32)
     img *= np.random.uniform(0.7, 1.3)
-    # Random contrast    ±20%
     mean = img.mean()
     img  = (img - mean) * np.random.uniform(0.8, 1.2) + mean
-    # Horizontal flip (50% chance) — person/ball appearance is flip-invariant
     if np.random.rand() < 0.5:
         img = img[:, ::-1, :].copy()
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def _to_tensor(img_rgb: np.ndarray, device: str = "cpu") -> torch.Tensor:
-    """Returns (3, H, W) — no batch dim. DataLoader adds batch; predict() adds manually."""
+def _to_tensor(img_rgb, device="cpu"):
     t = torch.from_numpy(img_rgb.astype(np.float32) / 255.0)
     return t.permute(2, 0, 1).to(device)
 
 
-def _encode_pose(kps: np.ndarray, W: int, H: int) -> np.ndarray:
+def _encode_pose(kps, W, H):
     flat = kps.copy().astype(np.float32)
     flat[:, 0] /= (W + 1e-6)
     flat[:, 1] /= (H + 1e-6)
     return flat.flatten()
 
 
-def _encode_spatial(pbox: np.ndarray, bbox: np.ndarray,
-                    W: int, H: int,
-                    kps: np.ndarray = None,
-                    vel_feat: np.ndarray = None) -> np.ndarray:
-    """
-    16-dim geometry + motion feature vector.
-
-    Dims 0-3:   person bbox (cx,cy,w,h normalised)
-    Dims 4-7:   object bbox (cx,cy,w,h normalised)
-    Dims 8-9:   person_centre - object_centre (relative position)
-    Dims 10-11: wrist_centre  - object_centre (most discriminative)
-    Dim  12:    best elbow extension 0-1  (throw=high, hold=low)
-    Dim  13:    wrist height above shoulder 0-1 (throw=high, catch=low)
-    Dim  14:    wrist speed 0-1  (holding=0, throwing/catching=high)
-    Dim  15:    wrist direction -1→+1  (throw=+1 up/forward, catch=-1 down)
-    """
+def _encode_spatial(pbox, bbox, W, H, kps=None, vel_feat=None):
     def _norm(b):
         cx = (b[0]+b[2]) / 2 / W
         cy = (b[1]+b[3]) / 2 / H
@@ -1069,80 +944,69 @@ def _encode_spatial(pbox: np.ndarray, bbox: np.ndarray,
         return np.array([cx, cy, w, h], dtype=np.float32)
 
     p = _norm(pbox); b = _norm(bbox)
-    person_to_obj = p[:2] - b[:2]
-
-    wrist_to_obj    = np.zeros(2,  dtype=np.float32)
-    elbow_ext       = np.zeros(1,  dtype=np.float32)
-    wrist_above_sh  = np.zeros(1,  dtype=np.float32)
+    person_to_obj   = p[:2] - b[:2]
+    wrist_to_obj    = np.zeros(2, dtype=np.float32)
+    elbow_ext       = np.zeros(1, dtype=np.float32)
+    wrist_above_sh  = np.zeros(1, dtype=np.float32)
 
     if kps is not None:
-        # Wrist-to-object (dims 10-11)
         best_c = -1.0
         for idx in (9, 10):
             wx, wy, wc = kps[idx]
             if wc > best_c:
-                best_c = wc
+                best_c       = wc
                 wrist_to_obj = np.array([
                     wx / (W + 1e-6) - b[0],
                     wy / (H + 1e-6) - b[1],
                 ], dtype=np.float32)
-
-        # Elbow extension (dim 12) — 0=bent, 1=straight
         for sh_i, el_i, wr_i in [(5,7,9), (6,8,10)]:
             sx,sy,sc = kps[sh_i]; ex,ey,ec = kps[el_i]; wx2,wy2,wc2 = kps[wr_i]
             if sc > 0.25 and ec > 0.25 and wc2 > 0.25:
-                ba = np.array([sx-ex, sy-ey])
+                ba  = np.array([sx-ex, sy-ey])
                 bc_ = np.array([wx2-ex, wy2-ey])
-                cos = np.dot(ba,bc_) / (np.linalg.norm(ba)*np.linalg.norm(bc_)+1e-8)
-                ang = math.degrees(math.acos(float(np.clip(cos,-1,1))))
+                cos = np.dot(ba, bc_) / (np.linalg.norm(ba)*np.linalg.norm(bc_)+1e-8)
+                ang = math.degrees(math.acos(float(np.clip(cos, -1, 1))))
                 elbow_ext[0] = max(elbow_ext[0], max(0.0, (ang-90)/90))
-
-        # Wrist above shoulder (dim 13) — throw=1, catch/hold=0
         for wk, sk in [(9,5),(10,6)]:
             wx3,wy3,wc3 = kps[wk]; ssx,ssy,ssc = kps[sk]
             if wc3 > 0.25 and ssc > 0.25:
                 wrist_above_sh[0] = max(wrist_above_sh[0],
                                         max(0.0, min(1.0, (ssy-wy3)/80)))
 
-    # Velocity features (dims 14-15)
-    if vel_feat is not None and len(vel_feat) == 2:
-        velocity = vel_feat.astype(np.float32)
-    else:
-        velocity = np.zeros(2, dtype=np.float32)
-    obj_w = (bbox[2] - bbox[0]) / (W + 1e-6)
-    obj_h = (bbox[3] - bbox[1]) / (H + 1e-6)
-    obj_aspect = np.array([
-        obj_w / (obj_h + 1e-6),          # aspect ratio
-        min(obj_w, obj_h),                # shorter side (size proxy)
-    ], dtype=np.float32)
+    velocity = vel_feat.astype(np.float32) if vel_feat is not None and len(vel_feat) == 2 \
+               else np.zeros(2, dtype=np.float32)
 
-    # NEW: is the wrist inside the object bbox? (strong holding signal)
+    obj_w      = (bbox[2] - bbox[0]) / (W + 1e-6)
+    obj_h      = (bbox[3] - bbox[1]) / (H + 1e-6)
+    obj_aspect = np.array([obj_w / (obj_h + 1e-6), min(obj_w, obj_h)],
+                          dtype=np.float32)
+
     wrist_in_obj = np.zeros(2, dtype=np.float32)
     if kps is not None:
         for fi, idx in enumerate((9, 10)):
             wx, wy, wc = kps[idx]
             if wc > 0.1:
-                in_x = bbox[0] < wx < bbox[2]
-                in_y = bbox[1] < wy < bbox[3]
-                wrist_in_obj[fi] = 1.0 if (in_x and in_y) else 0.0
-    return np.concatenate([p, b, person_to_obj,wrist_to_obj, elbow_ext, wrist_above_sh, velocity, obj_aspect, wrist_in_obj])
+                wrist_in_obj[fi] = 1.0 if (bbox[0] < wx < bbox[2]
+                                            and bbox[1] < wy < bbox[3]) else 0.0
 
-def _box_dist(bbox: np.ndarray, cx: float, cy: float) -> float:
+    return np.concatenate([p, b, person_to_obj, wrist_to_obj,
+                           elbow_ext, wrist_above_sh, velocity,
+                           obj_aspect, wrist_in_obj])
+
+
+def _box_dist(bbox, cx, cy):
     return math.hypot((bbox[0]+bbox[2])/2 - cx, (bbox[1]+bbox[3])/2 - cy)
 
 
 def _parse_yolo_static(r, H=None, W=None):
-    """Dataset version of _parse_yolo — matches two-threshold logic, no self."""
-    persons   = []
-    objects   = []
-    kp_data   = r.keypoints.data if r.keypoints is not None else None
+    persons  = []
+    objects  = []
+    kp_data  = r.keypoints.data if r.keypoints is not None else None
     kp_cursor = 0
-
     for box in r.boxes:
         cls  = int(box.cls[0])
         conf = float(box.conf[0])
         bbox = np.array(box.xyxy[0].tolist(), dtype=np.float32)
-
         if cls == PERSON_CLS:
             kps = (kp_data[kp_cursor].cpu().numpy()
                    if kp_data is not None and kp_cursor < len(kp_data)
@@ -1150,12 +1014,10 @@ def _parse_yolo_static(r, H=None, W=None):
             kp_cursor += 1
             if conf >= PERSON_CONF:
                 persons.append({"bbox": bbox, "kps": kps})
-        elif cls in OBJECT_CLASSES:
-            if conf >= OBJECT_CONF:
-                objects.append({"bbox": bbox, "conf": conf, "cls": cls})
+        elif cls in OBJECT_CLASSES and conf >= OBJECT_CONF:
+            objects.append({"bbox": bbox, "conf": conf, "cls": cls})
 
     best_obj = None
-
     if objects and persons:
         kps    = persons[0]["kps"]
         wrists = [(float(kps[i][0]), float(kps[i][1]))
@@ -1164,13 +1026,12 @@ def _parse_yolo_static(r, H=None, W=None):
             def wrist_dist(obj):
                 ocx = (obj["bbox"][0] + obj["bbox"][2]) / 2
                 ocy = (obj["bbox"][1] + obj["bbox"][3]) / 2
-                return min(math.hypot(ocx - wx, ocy - wy) for wx, wy in wrists)
+                return min(math.hypot(ocx-wx, ocy-wy) for wx, wy in wrists)
             best_obj = min(objects, key=wrist_dist)["bbox"]
         else:
             best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
     elif objects:
         best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
-
     return persons, best_obj
 
 
@@ -1187,6 +1048,8 @@ def draw_results(frame: np.ndarray, result: HOIResult,
 
     if result.ball_bbox is not None:
         x1,y1,x2,y2 = result.ball_bbox.astype(int)
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(W, x2); y2 = min(H, y2)
         if x2 > x1 and y2 > y1:
             cv2.rectangle(out, (x1,y1), (x2,y2), COLORS["ball"], 2)
             cv2.putText(out, "object", (x1, max(y1-6,12)),
@@ -1194,6 +1057,8 @@ def draw_results(frame: np.ndarray, result: HOIResult,
 
     if result.person_bbox is not None:
         x1,y1,x2,y2 = result.person_bbox.astype(int)
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(W, x2); y2 = min(H, y2)
         if x2 > x1 and y2 > y1:
             cv2.rectangle(out, (x1,y1), (x2,y2), color, 2)
             bg_y = max(y1-24, 0)
