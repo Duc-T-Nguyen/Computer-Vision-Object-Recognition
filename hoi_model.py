@@ -26,35 +26,33 @@ HOI_IDX     = {c: i for i, c in enumerate(HOI_CLASSES)}
 
 PERSON_CLS    = 0
 OBJECT_CLASSES = [
-    32,   # sports ball
-    39,   # bottle
-    41,   # cup
-    45,   # bowl
-    46,   # banana
-    47,   # apple
-    49,   # orange
-    63,   # laptop
-    64,   # mouse
-    65,   # remote
-    66,   # keyboard
-    67,   # cell phone
-    73,   # book
-    74,   # clock
-    76,   # scissors
-    77,   # teddy bear
-    78,   # hair drier
-    79,   # toothbrush
+    32,   
+    39,   
+    41,   
+    45,   
+    46,   
+    47,   
+    49,   
+    63,   
+    64,   
+    65, 
+    66,   
+    67,  
+    73,  
+    74,  
+    76,   
+    77,   
 ]
 BALL_CLS      = 32
 
 PERSON_CONF   = 0.40
-OBJECT_CONF   = 0.15          
+OBJECT_CONF   = 0.18          
 
 
 MIN_OBJ_PERSON_AREA_RATIO = 0.008   
-MAX_OBJ_PERSON_AREA_RATIO = 0.30    
-WRIST_SEARCH_RATIO = 0.70           
-MIN_OBJECT_CONF_FINAL = 0.20       
+MAX_OBJ_PERSON_AREA_RATIO = 0.55    
+WRIST_SEARCH_RATIO = 0.90           
+MIN_OBJECT_CONF_FINAL = 0.18      
 
 CROP_SIZE   = 64
 D_MODEL     = 128
@@ -97,9 +95,9 @@ class HOIResult:
 
 class BBoxSmoother:
     
-    RESET_FRAMES = 5
+    RESET_FRAMES = 2
 
-    def __init__(self, alpha: float = 0.50):
+    def __init__(self, alpha: float = 0.90):
         self.alpha       = alpha
         self._smoothed   = None
         self._none_count = 0
@@ -115,13 +113,8 @@ class BBoxSmoother:
         if self._smoothed is None:
             self._smoothed = bbox.copy()
         else:
-            # NEW: reset if detection jumps more than 20% of frame width
-            prev_cx = (self._smoothed[0] + self._smoothed[2]) / 2
-            new_cx  = (bbox[0] + bbox[2]) / 2
-            if abs(new_cx - prev_cx) > 0.20 * (bbox[2] - bbox[0]) * 3:
-                self._smoothed = bbox.copy()  # hard reset on large jump
-            else:
-                self._smoothed = (self.alpha * bbox + (1.0 - self.alpha) * self._smoothed)
+            self._smoothed = (self.alpha * bbox + (1.0 - self.alpha) * self._smoothed)
+
         return self._smoothed.copy()
 
     def reset(self):
@@ -193,15 +186,15 @@ class WristVelocityTracker:
 # Ballistic object tracker
 # ══════════════════════════════════════════════════════════════
 class BallisticTracker:
-    MAX_COASTING = 30
+    MAX_COASTING = 6
 
     def __init__(self):
-        self._bbox:       Optional[np.ndarray] = None
-        self._vel:        np.ndarray = np.zeros(4, dtype=np.float32)
-        self._prev_bbox:  Optional[np.ndarray] = None
-        self._prev_t:     float = 0.0
+        self._bbox:         Optional[np.ndarray] = None
+        self._vel:          np.ndarray = np.zeros(4, dtype=np.float32)
+        self._prev_bbox:    Optional[np.ndarray] = None
+        self._prev_t:       float = 0.0
         self._coast_frames: int = 0
-        self._last_t:     float = 0.0
+        self._last_t:       float = 0.0
 
     def update(self, bbox: Optional[np.ndarray]) -> Optional[np.ndarray]:
         now = time.monotonic()
@@ -210,8 +203,8 @@ class BallisticTracker:
 
         if bbox is not None:
             if self._prev_bbox is not None and self._prev_t:
-                prev_dt    = max(now - self._prev_t, 1e-3)
-                self._vel  = (bbox - self._prev_bbox) / prev_dt
+                prev_dt   = max(now - self._prev_t, 1e-3)
+                self._vel = (bbox - self._prev_bbox) / prev_dt
             self._prev_bbox    = self._bbox
             self._prev_t       = now
             self._bbox         = bbox.copy()
@@ -227,10 +220,7 @@ class BallisticTracker:
             self._vel  = np.zeros(4, dtype=np.float32)
             return None
 
-        gravity     = np.array([0.0, 180.0, 0.0, 180.0], dtype=np.float32)
-        self._bbox  = self._bbox + self._vel * dt + 0.5 * gravity * dt * dt
-        self._vel[1] += gravity[1] * dt
-        self._vel[3] += gravity[3] * dt
+        # Hold last known position — no gravity
         return self._bbox.copy()
 
     @property
@@ -244,7 +234,6 @@ class BallisticTracker:
     def reset(self):
         self.__init__()
 
-
 # ══════════════════════════════════════════════════════════════
 # Throw state machine
 # ══════════════════════════════════════════════════════════════
@@ -257,9 +246,9 @@ class ThrowState(Enum):
     FOLLOW  = "follow"
 
 class ThrowStateMachine:
-    SPEED_WINDUP      = 0.25
-    SPEED_DROP        = 0.10
-    RELEASE_DIST_JUMP = 0.12
+    SPEED_WINDUP      = 0.35
+    SPEED_DROP        = 0.12
+    RELEASE_DIST_JUMP = 0.15
     FOLLOW_FRAMES     = 22
     WINDUP_TIMEOUT    = 45
 
@@ -318,7 +307,7 @@ class ThrowStateMachine:
 
 
 class AsymmetricSmoother:
-    def __init__(self, alpha_rise=0.70, alpha_fall=0.30, alpha_std=0.40):
+    def __init__(self, alpha_rise=0.60, alpha_fall=0.15, alpha_std=0.35):
         self.alpha_rise = alpha_rise
         self.alpha_fall = alpha_fall
         self.alpha_std  = alpha_std
@@ -338,7 +327,6 @@ class AsymmetricSmoother:
 
     def reset(self):
         self.smoothed = {c: 1.0 / NUM_HOI for c in HOI_CLASSES}
-
 
 # ══════════════════════════════════════════════════════════════
 # HOI Head
@@ -477,6 +465,8 @@ class HOIDetector:
         self._throw_sm     = ThrowStateMachine()
         self._prev_wrist_to_obj_dist = None
         self._fidx = 0
+        self._last_confirmed_obj_bbox = None   
+        self._frames_since_detection  = 0
         print(f"[HOI] Ready on {device}.")
 
     def predict(self, frame_bgr: np.ndarray, debug: bool = False) -> HOIResult:
@@ -508,6 +498,37 @@ class HOIDetector:
         persons, raw_ball_bbox = self._parse_two_results(
             pose_results[0], det_results[0], H, W
         )
+        # Track how long since we had a real detection
+        if raw_ball_bbox is not None:
+            self._last_confirmed_obj_bbox = raw_ball_bbox.copy()
+            self._frames_since_detection  = 0
+        else:
+            self._frames_since_detection += 1
+
+        # If detection just dropped but we recently had it, anchor to wrist
+        # Only activate within 20 frames of last confirmed detection
+        if raw_ball_bbox is None and self._frames_since_detection <= 20 and persons:
+            kps_tmp  = persons[0]["kps"]
+            best_wc  = -1.0
+            best_wx  = best_wy = None
+            for idx in (9, 10):
+                wx, wy, wc = float(kps_tmp[idx][0]), float(kps_tmp[idx][1]), float(kps_tmp[idx][2])
+                if wc > best_wc:
+                    best_wc  = wc
+                    best_wx, best_wy = wx, wy
+
+            if best_wc > 0.20 and best_wx is not None:
+                # Use last known object size, centered on wrist
+                if self._last_confirmed_obj_bbox is not None:
+                    lx1,ly1,lx2,ly2 = self._last_confirmed_obj_bbox
+                    half_w = (lx2 - lx1) / 2
+                    half_h = (ly2 - ly1) / 2
+                else:
+                    half_w = half_h = 40
+                raw_ball_bbox = np.array([
+                    best_wx - half_w, best_wy - half_h,
+                    best_wx + half_w, best_wy + half_h,
+                ], dtype=np.float32)
 
         # Clamp raw detection to frame (FIX 6)
         if raw_ball_bbox is not None:
@@ -516,6 +537,8 @@ class HOIDetector:
         # BBox smoother before ballistic (FIX 5)
         smoothed_obj = self._bbox_smooth.update(raw_ball_bbox)
 
+        
+
         # Ballistic prediction if detector misses
         ball_bbox = self._ballistic.update(smoothed_obj)
 
@@ -523,7 +546,9 @@ class HOIDetector:
             ball_bbox = _clamp_bbox(ball_bbox, W, H)
 
         if ball_bbox is None or not persons:
-            self._throw_sm.reset()
+            # Only reset throw state if we've been missing for a while
+            if not self._ballistic.coasting:
+                self._throw_sm.reset()
             empty = {c: (1.0 if c == "no_interaction" else 0.0) for c in HOI_CLASSES}
             sm    = self.smoother.update(empty)
             pb    = persons[0]["bbox"] if persons else None
@@ -559,6 +584,18 @@ class HOIDetector:
         vel_speed         = float(vel_feat[0])
         vel_direction     = float(vel_feat[1])
 
+        # Blend neural net with geometry-based scores (0.35 net / 0.65 geometry)
+        # Since net has weak/random weights, geometry dominates until retrained
+        geo_scores = _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H)
+        NET_WEIGHT = 0.35
+        GEO_WEIGHT = 0.65
+        frame_scores = {
+            c: NET_WEIGHT * frame_scores.get(c, 0.0) + GEO_WEIGHT * geo_scores.get(c, 0.0)
+            for c in HOI_CLASSES
+        }
+        total = sum(frame_scores.values()) + 1e-9
+        frame_scores = {c: v / total for c, v in frame_scores.items()}
+
         frame_scores = self._throw_sm.update(
             vel_speed, vel_direction, wrist_to_obj_dist, frame_scores,
         )
@@ -592,16 +629,6 @@ class HOIDetector:
             print(f"[HOI] Could not load HOI head: {e}")
 
     def _parse_two_results(self, pose_r, det_r, H, W):
-        """
-        Parse results from two separate YOLO calls.
-
-        Key fixes vs original:
-        - Object bbox size is validated against person bbox (not raw frame size)
-        - Wrist search radius is relative to person width
-        - Improved fallback chain: wrist → person-interior → highest-conf
-        - IoU-based dedup removes overlapping low-conf detections
-        - All returned bboxes are clamped to frame bounds
-        """
         # ── Persons from pose result ─────────────────────────────────────
         persons   = []
         kp_data   = pose_r.keypoints.data if pose_r.keypoints is not None else None
@@ -645,15 +672,17 @@ class HOIDetector:
         for o in raw_objects:
             a     = obj_area(o)
             ratio = a / person_area
-            if (MIN_OBJ_PERSON_AREA_RATIO <= ratio <= MAX_OBJ_PERSON_AREA_RATIO
-                    and o["conf"] >= MIN_OBJECT_CONF_FINAL):
-                objects.append(o)
+            if MIN_OBJ_PERSON_AREA_RATIO <= ratio <= MAX_OBJ_PERSON_AREA_RATIO:
+                # Accept lower confidence if object is small (thin objects like pens)
+                min_conf = 0.15 if ratio < 0.05 else MIN_OBJECT_CONF_FINAL
+                if o["conf"] >= min_conf:
+                    objects.append(o)
 
         # If strict filter removes everything, fall back to looser area check
         if not objects:
             objects = [o for o in raw_objects
                        if obj_area(o) / person_area >= MIN_OBJ_PERSON_AREA_RATIO * 0.4
-                       and o["conf"] >= OBJECT_CONF]
+                       and o["conf"] >= 0.12]  
 
         if not objects:
             return persons, None
@@ -706,7 +735,7 @@ class HOIDetector:
 
         # Final fallback — highest-confidence object
         if best_obj is None:
-            best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
+            return persons, None
 
         return persons, best_obj
 
@@ -1034,6 +1063,87 @@ def _parse_yolo_static(r, H=None, W=None):
         best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
     return persons, best_obj
 
+def _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H) -> dict:
+    """
+    Rule-based HOI scores from pure geometry + velocity.
+    Used to bias the neural net output toward correct classifications.
+    """
+    scores = {c: 0.0 for c in HOI_CLASSES}
+
+    px1, py1, px2, py2 = pbox
+    person_h = py2 - py1
+    person_w = px2 - px1
+
+    bcx = (ball_bbox[0] + ball_bbox[2]) / 2
+    bcy = (ball_bbox[1] + ball_bbox[3]) / 2
+
+    # Find best wrist
+    best_wrist = None
+    best_wc    = -1.0
+    for idx in (9, 10):
+        wx, wy, wc = float(kps[idx][0]), float(kps[idx][1]), float(kps[idx][2])
+        if wc > best_wc:
+            best_wc    = wc
+            best_wrist = (wx, wy)
+
+    vel_speed     = float(vel_feat[0]) if vel_feat is not None else 0.0
+    vel_direction = float(vel_feat[1]) if vel_feat is not None else 0.0
+
+    if best_wrist is None or best_wc < 0.15:
+        scores["no_interaction"] = 1.0
+        return scores
+
+    wx, wy = best_wrist
+    wrist_to_obj_dist = math.hypot(wx - bcx, wy - bcy)
+    proximity_thresh  = person_w * 0.70
+
+    obj_near_wrist = wrist_to_obj_dist < proximity_thresh
+
+    if not obj_near_wrist:
+        if vel_speed > 0.45:
+            # Object far from wrist + fast movement = thrown object in flight
+            scores["throwing"]       = 0.55
+            scores["catching"]       = 0.25
+            scores["no_interaction"] = 0.20
+        else:
+            # Object far, wrist slow = definitely no interaction
+            scores["no_interaction"] = 0.90
+            scores["holding"]        = 0.10
+        return scores
+
+    # Object is near wrist
+    # Object is near wrist
+    if vel_speed < 0.15:
+        # Slow/still wrist with object nearby = holding
+        scores["holding"]        = 0.85
+        scores["no_interaction"] = 0.10
+        scores["throwing"]       = 0.03
+        scores["catching"]       = 0.02
+
+    elif vel_speed > 0.40 and vel_direction > 0.45:
+        # Must be BOTH fast AND strongly upward to be throwing
+        # Prevents angled holding from triggering throw
+        scores["throwing"]       = 0.65
+        scores["holding"]        = 0.20
+        scores["catching"]       = 0.10
+        scores["no_interaction"] = 0.05
+
+    elif vel_speed > 0.35 and vel_direction < -0.40:
+        # Fast downward = catching
+        scores["catching"]       = 0.60
+        scores["holding"]        = 0.25
+        scores["throwing"]       = 0.10
+        scores["no_interaction"] = 0.05
+
+    else:
+        # Moving but not clearly throw/catch direction — default to holding
+        # This fixes the "holding at angle = throwing" problem
+        scores["holding"]        = 0.65
+        scores["throwing"]       = 0.15
+        scores["catching"]       = 0.12
+        scores["no_interaction"] = 0.08
+
+    return scores
 
 # ══════════════════════════════════════════════════════════════
 # Visualization
