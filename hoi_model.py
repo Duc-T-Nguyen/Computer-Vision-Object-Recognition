@@ -248,7 +248,7 @@ class ThrowState(Enum):
 class ThrowStateMachine:
     SPEED_WINDUP      = 0.35
     SPEED_DROP        = 0.12
-    RELEASE_DIST_JUMP = 0.15
+    RELEASE_DIST_JUMP = 0.22
     FOLLOW_FRAMES     = 22
     WINDUP_TIMEOUT    = 45
 
@@ -269,8 +269,8 @@ class ThrowStateMachine:
 
         elif self.state == ThrowState.WINDUP:
             self._windup_count += 1
-            dist_jumped = (prev_dist is not None
-                           and wrist_obj_dist - prev_dist > self.RELEASE_DIST_JUMP)
+            dist_jumped = (prev_dist is not None and wrist_obj_dist - prev_dist > self.RELEASE_DIST_JUMP and vel_speed > .40)
+
             if dist_jumped:
                 self.state         = ThrowState.RELEASE
                 self._follow_count = 0
@@ -307,7 +307,7 @@ class ThrowStateMachine:
 
 
 class AsymmetricSmoother:
-    def __init__(self, alpha_rise=0.60, alpha_fall=0.15, alpha_std=0.35):
+    def __init__(self, alpha_rise=0.55, alpha_fall=0.30, alpha_std=0.35):
         self.alpha_rise = alpha_rise
         self.alpha_fall = alpha_fall
         self.alpha_std  = alpha_std
@@ -362,7 +362,7 @@ class SpatialMLP(nn.Module):
     def __init__(self, out_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(20, 64), nn.ReLU(True),
+            nn.Linear(21, 64), nn.ReLU(True),
             nn.Linear(64, out_dim), nn.LayerNorm(out_dim),
         )
     def forward(self, x):
@@ -461,7 +461,7 @@ class HOIDetector:
         self.smoother      = AsymmetricSmoother()
         self.wrist_vel     = WristVelocityTracker(history=6)
         self._ballistic    = BallisticTracker()
-        self._bbox_smooth  = BBoxSmoother(alpha=0.50)   # FIX 5
+        self._bbox_smooth  = BBoxSmoother(alpha=0.75) 
         self._throw_sm     = ThrowStateMachine()
         self._prev_wrist_to_obj_dist = None
         self._fidx = 0
@@ -584,11 +584,11 @@ class HOIDetector:
         vel_speed         = float(vel_feat[0])
         vel_direction     = float(vel_feat[1])
 
-        # Blend neural net with geometry-based scores (0.35 net / 0.65 geometry)
+        # Blend neural net with geometry-based scores (0.70 net / 0.30 geometry)
         # Since net has weak/random weights, geometry dominates until retrained
         geo_scores = _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H)
-        NET_WEIGHT = 0.35
-        GEO_WEIGHT = 0.65
+        NET_WEIGHT = 0.70
+        GEO_WEIGHT = 0.30
         frame_scores = {
             c: NET_WEIGHT * frame_scores.get(c, 0.0) + GEO_WEIGHT * geo_scores.get(c, 0.0)
             for c in HOI_CLASSES
@@ -783,7 +783,7 @@ class HOIDetector:
 class HOILoss(nn.Module):
     def __init__(self):
         super().__init__()
-        weights = torch.tensor([2.0, 0.7, 2.5, 2.0], dtype=torch.float32)
+        weights = torch.tensor([2.0, 2.0, 2.5, 1.5], dtype=torch.float32)  # class imbalance weights
         self.ce = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
 
     def forward(self, logits, labels):
@@ -1001,9 +1001,17 @@ def _encode_spatial(pbox, bbox, W, H, kps=None, vel_feat=None):
             if wc3 > 0.25 and ssc > 0.25:
                 wrist_above_sh[0] = max(wrist_above_sh[0],
                                         max(0.0, min(1.0, (ssy-wy3)/80)))
+    obj_above_shoulder = np.zeros(1, dtype=np.float32)
+    if kps is not None:
+        bcy = (bbox[1] + bbox[3]) / 2 
+        for sh_idx in (5, 6):
+            sx, sy, sc = kps[sh_idx]
+            if sc > 0.25:
+                ph = (pbox[3] - pbox[1])
+                obj_above_shoulder[0] = max(obj_above_shoulder[0],
+                                            max(0.0, min(1.0, (sy - bcy) / (ph + 1e-6))))
 
-    velocity = vel_feat.astype(np.float32) if vel_feat is not None and len(vel_feat) == 2 \
-               else np.zeros(2, dtype=np.float32)
+    velocity = vel_feat.astype(np.float32)
 
     obj_w      = (bbox[2] - bbox[0]) / (W + 1e-6)
     obj_h      = (bbox[3] - bbox[1]) / (H + 1e-6)
@@ -1020,7 +1028,7 @@ def _encode_spatial(pbox, bbox, W, H, kps=None, vel_feat=None):
 
     return np.concatenate([p, b, person_to_obj, wrist_to_obj,
                            elbow_ext, wrist_above_sh, velocity,
-                           obj_aspect, wrist_in_obj])
+                           obj_aspect, wrist_in_obj, obj_above_shoulder])
 
 
 def _box_dist(bbox, cx, cy):
@@ -1063,7 +1071,7 @@ def _parse_yolo_static(r, H=None, W=None):
         best_obj = max(objects, key=lambda o: o["conf"])["bbox"]
     return persons, best_obj
 
-def _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H) -> dict:
+def _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H, throw_state = None) -> dict:
     """
     Rule-based HOI scores from pure geometry + velocity.
     Used to bias the neural net output toward correct classifications.
@@ -1123,7 +1131,8 @@ def _geometry_hoi_scores(pbox, ball_bbox, kps, vel_feat, W, H) -> dict:
     elif vel_speed > 0.40 and vel_direction > 0.45:
         # Must be BOTH fast AND strongly upward to be throwing
         # Prevents angled holding from triggering throw
-        scores["throwing"]       = 0.65
+        throwing_score = .75 if throw_state != "throwing" else .65
+        scores["throwing"]       = throwing_score
         scores["holding"]        = 0.20
         scores["catching"]       = 0.10
         scores["no_interaction"] = 0.05
