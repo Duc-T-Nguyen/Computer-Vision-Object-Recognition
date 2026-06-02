@@ -103,4 +103,3 @@ Use `--no-checkpoint` to run with random weights for pipeline testing.
 - `test_hoi.py` uses `HOIDetector` from `hoi_model.py`.
 - `data_collector.py` writes metadata to `data/metadata.json`.
 - `frames_capture.py` stores captured frames under `testing_frames/frame_folder_vid_<N>/`.
-
